@@ -6,8 +6,8 @@
 #
 # Key differences from RTX 4070 config:
 # - 4.7x larger model (7B vs 0.72B)
-# - No checkpointing (A100 has plenty of VRAM)
-# - Larger batch size (8 vs 2)
+# - Checkpointing enabled (7B activations too large without it)
+# - Larger batch size (4 vs 2)
 # - Larger chunk_size (64 vs 32)
 # - No CPU offload
 
@@ -29,7 +29,7 @@ model:
 # Mamba-2 specific
 mamba:
   use_matmul_ssd: true    # Matmul-based SSD (Tensor Core friendly)
-  use_checkpointing: false # A100 has enough VRAM - no checkpointing needed!
+  use_checkpointing: true  # Required: 7B without checkpointing OOMs at 39GB
   use_cuda_ssd: false      # Use PyTorch matmul variant (more portable)
   chunk_size: 64           # Larger chunks for better efficiency
   n_heads: 16              # Mamba heads: d_inner=8192, head_dim=512
@@ -39,8 +39,8 @@ mamba:
 # Training
 training:
   max_steps: 50000
-  batch_size: 8                       # A100 can handle larger batches
-  gradient_accumulation_steps: 4      # effective batch = 4x8x2048 = 65536 tok/step
+  batch_size: 4                       # batch=4 with checkpointing fits in 40GB
+  gradient_accumulation_steps: 8      # effective batch = 8x4x2048 = 65536 tok/step
   seq_len: 2048
 
   # Learning rates
@@ -107,17 +107,18 @@ evaluation:
 #   FP32 params (0.3B × 4 B/param):         1.20 GB
 #   Subtotal:                                6.45 GB
 #
-# Activations (batch=8, seq=2048, no checkpoint):
-#   Per-layer x tensor:                      ~134 MB
-#   Mamba intermediates (24 layers):         ~7.2 GB
-#   MLA intermediates (8 layers):            ~2.4 GB
-#   INT8 saved activations (~180 layers):    ~4.8 GB
-#   Subtotal:                               ~14.5 GB
+# Activations (batch=4, seq=2048, WITH checkpointing):
+#   Checkpointed Mamba (24 layers):         ~4.0 GB
+#   MLA intermediates (8 layers):            ~1.2 GB
+#   INT8 saved activations (~249 layers):    ~3.2 GB
+#   Subtotal:                               ~8.4 GB
 #
 # Optimizer (AdamW for FP32 only):
 #   300M × 12 bytes:                         3.6 GB
 #
 # Temporary (gradients, workspace):          ~2.0 GB
 #
-# TOTAL ESTIMATED:                          ~26.5 GB / 40 GB
-# HEADROOM:                                 ~13.5 GB
+# TOTAL ESTIMATED:                          ~20.5 GB / 40 GB
+# HEADROOM:                                 ~19.5 GB
+#
+# NOTE: batch=8 without checkpointing OOMs at ~39GB (tested 2026-02-08)
