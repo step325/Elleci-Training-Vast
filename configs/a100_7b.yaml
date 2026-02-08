@@ -1,0 +1,123 @@
+# Elleci 7B - A100 40GB Configuration
+#
+# Target: ~7.3B params (7.0B INT2 + 0.3B FP32)
+# Hardware: NVIDIA A100 40GB (sm_80, Ampere)
+# Throughput estimate: 4,000-6,000 tok/s
+#
+# Key differences from RTX 4070 config:
+# - 4.7x larger model (7B vs 0.72B)
+# - No checkpointing (A100 has plenty of VRAM)
+# - Larger batch size (8 vs 2)
+# - Larger chunk_size (64 vs 32)
+# - No CPU offload
+
+# Model - 7B Config
+model:
+  d_model: 4096        # LLaMA-7B scale
+  n_layers: 32          # 24 Mamba + 8 MLA (75/25 pattern)
+  n_heads: 32           # MLA heads: 4096/32 = 128 head_dim
+  use_moe: false        # MoE incompatible with INT2 hysteresis (batch dim mismatch)
+  vocab_size: 32128
+  max_seq_len: 2048     # Extended context for A100
+
+  # INT2 specific
+  use_int2: true
+  int2_threshold: 7
+  int2_lr_scale: 5.0
+  int2_decay_rate: 0.001
+
+# Mamba-2 specific
+mamba:
+  use_matmul_ssd: true    # Matmul-based SSD (Tensor Core friendly)
+  use_checkpointing: false # A100 has enough VRAM - no checkpointing needed!
+  use_cuda_ssd: false      # Use PyTorch matmul variant (more portable)
+  chunk_size: 64           # Larger chunks for better efficiency
+  n_heads: 16              # Mamba heads: d_inner=8192, head_dim=512
+  d_state: 16
+  expand: 2
+
+# Training
+training:
+  max_steps: 50000
+  batch_size: 8                       # A100 can handle larger batches
+  gradient_accumulation_steps: 4      # effective batch = 4x8x2048 = 65536 tok/step
+  seq_len: 2048
+
+  # Learning rates
+  int2_lr: 0.1             # Per hysteresis update
+  adamw_lr: 0.0003         # Per embedding/norms (3e-4, higher for larger model)
+  warmup_steps: 2000
+  weight_decay: 0.01
+
+  # Mixed precision
+  mixed_precision: bf16
+
+  # Gradient clipping
+  max_grad_norm: 1.0
+
+  # CPU offload for INT2 activations
+  enable_offload: false    # A100 has enough VRAM
+
+# Optimizations
+optimizations:
+  # Disabled for INT2
+  use_deepspeed: false
+  use_zero: false
+  cpu_offload: false
+  gradient_checkpointing: false
+  use_8bit_adamw: false
+
+  # Enabled
+  use_liger_cross_entropy: true
+  use_liger_rmsnorm: true
+  use_flash_attention: true
+  compile_model: false
+
+# Logging
+logging:
+  log_interval: 50
+  eval_interval: 1000
+  save_interval: 5000
+  wandb_project: "elleci-int2-7b"
+  wandb_run_name: "7b-a100-50k"
+
+# Checkpointing
+checkpointing:
+  output_dir: "checkpoints/7b_training"
+  save_total_limit: 3
+  resume_from: null
+
+# Data
+data:
+  dataset: "fineweb-edu"
+  tokenizer_path: "tokenizer/tokenizer.json"
+  streaming: true
+  num_workers: 8
+
+# Evaluation
+evaluation:
+  eval_samples: 1000
+  generate_samples: 5
+  max_new_tokens: 100
+
+# --- VRAM Budget Estimate (A100 40GB) ---
+# Model static:
+#   INT2 weights (7.0B × 0.25 B/param):    1.75 GB
+#   Hysteresis counters (7.0B × 0.5 B/param): 3.50 GB
+#   FP32 params (0.3B × 4 B/param):         1.20 GB
+#   Subtotal:                                6.45 GB
+#
+# Activations (batch=8, seq=2048, no checkpoint):
+#   Per-layer x tensor:                      ~134 MB
+#   Mamba intermediates (24 layers):         ~7.2 GB
+#   MLA intermediates (8 layers):            ~2.4 GB
+#   INT8 saved activations (~180 layers):    ~4.8 GB
+#   Subtotal:                               ~14.5 GB
+#
+# Optimizer (AdamW for FP32 only):
+#   300M × 12 bytes:                         3.6 GB
+#
+# Temporary (gradients, workspace):          ~2.0 GB
+#
+# TOTAL ESTIMATED:                          ~26.5 GB / 40 GB
+# HEADROOM:                                 ~13.5 GB

@@ -1,0 +1,27 @@
+# Elleci V2 - Training Requirements
+# Updated 2026-01 with latest stable versions
+
+# Core
+torch>=2.5.0
+transformers>=4.45.0
+tokenizers>=0.20.0
+
+# Optimization
+liger-kernel>=0.6.0
+bitsandbytes>=0.44.0
+accelerate>=1.0.0
+deepspeed>=0.15.0
+
+# Data
+datasets>=3.0.0
+
+# Logging
+wandb>=0.18.0
+tqdm>=4.66.0
+
+# Mamba dependencies
+einops>=0.8.0
+causal-conv1d>=1.4.0
+mamba-ssm>=2.0.0
+accelerated-scan>=0.2.0
+

@@ -1,0 +1,96 @@
+# INT2 Training Configuration - RTX 4070 12GB
+#
+# RIDOTTO per Elleci completo (Mamba + MLA + embedding + norms)
+# Target: <8GB peak per avere margine di sicurezza
+#
+# NOTA: Questo config DISABILITA DeepSpeed/ZeRO perche INT2
+# non ha optimizer state per i pesi quantizzati.
+
+# Model - Config S ottimale per RTX 4070 12GB (peak ~7.6GB)
+model:
+  d_model: 1536       # Config S validata
+  n_layers: 20        # Config S validata
+  n_heads: 16         # 1536 / 16 = 96 head_dim
+  use_moe: false      # MoE incompatibile con INT2 offload
+  vocab_size: 32128
+  max_seq_len: 512
+
+  # INT2 specific
+  use_int2: true
+  int2_threshold: 7
+  int2_lr_scale: 5.0
+  int2_decay_rate: 0.001
+
+# Training
+training:
+  max_steps: 9000
+  batch_size: 2                       # batch=2 con checkpointing matmul-SSD
+  gradient_accumulation_steps: 8      # effective batch = 8x2x512 = 8192 tok/step
+  seq_len: 512
+
+  # Learning rates
+  int2_lr: 0.1            # Per hysteresis update
+  adamw_lr: 0.0001        # Per embedding/norms (1e-4)
+  warmup_steps: 2000
+  weight_decay: 0.01
+
+  # Mixed precision (MANTIENI)
+  mixed_precision: bf16
+
+  # Gradient clipping
+  max_grad_norm: 1.0
+
+  # CPU offload for INT2 activations
+  enable_offload: false    # Disabled: sync elimination saves more than offload
+
+# Mamba-2 specific
+mamba:
+  use_matmul_ssd: true     # Matmul-based SSD (Tensor Core friendly)
+  use_checkpointing: true  # Required: without it batch=2 → 25.3GB OOM
+  use_cuda_ssd: false
+  chunk_size: 32           # Smaller chunks for RTX 4070 VRAM
+  n_heads: 16
+  d_state: 16
+  expand: 2
+
+# Ottimizzazioni
+optimizations:
+  # DISABILITATI per INT2
+  use_deepspeed: false
+  use_zero: false
+  cpu_offload: false
+  gradient_checkpointing: false
+  use_8bit_adamw: false
+
+  # MANTENUTI
+  use_liger_cross_entropy: true
+  use_liger_rmsnorm: true
+  use_flash_attention: true
+  compile_model: false  # torch.compile puo dare problemi con custom kernels
+
+# Logging
+logging:
+  log_interval: 100
+  eval_interval: 1000
+  save_interval: 5000
+  wandb_project: "elleci-int2"
+  wandb_run_name: "50k-config-s-1536x20"
+
+# Checkpointing
+checkpointing:
+  output_dir: "checkpoints/training_50k"
+  save_total_limit: 5
+  resume_from: null
+
+# Data
+data:
+  dataset: "fineweb-edu"
+  tokenizer_path: "tokenizer/tokenizer.json"
+  streaming: true
+  num_workers: 4
+
+# Evaluation
+evaluation:
+  eval_samples: 1000
+  generate_samples: 5
+  max_new_tokens: 100
