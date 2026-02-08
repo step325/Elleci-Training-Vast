@@ -18,7 +18,7 @@ model:
   n_heads: 32           # MLA heads: 4096/32 = 128 head_dim
   use_moe: false        # MoE incompatible with INT2 hysteresis (batch dim mismatch)
   vocab_size: 32128
-  max_seq_len: 2048     # Extended context for A100
+  max_seq_len: 1024     # Reduced to fit 7B in A100 40GB
 
   # INT2 specific
   use_int2: true
@@ -31,7 +31,7 @@ mamba:
   use_matmul_ssd: true    # Matmul-based SSD (Tensor Core friendly)
   use_checkpointing: true  # Required: 7B without checkpointing OOMs at 39GB
   use_cuda_ssd: false      # Use PyTorch matmul variant (more portable)
-  chunk_size: 64           # Larger chunks for better efficiency
+  chunk_size: 32           # Smaller chunks to reduce VRAM peak
   n_heads: 16              # Mamba heads: d_inner=8192, head_dim=512
   d_state: 16
   expand: 2
@@ -39,9 +39,9 @@ mamba:
 # Training
 training:
   max_steps: 50000
-  batch_size: 4                       # batch=4 with checkpointing fits in 40GB
-  gradient_accumulation_steps: 8      # effective batch = 8x4x2048 = 65536 tok/step
-  seq_len: 2048
+  batch_size: 2                       # batch=2 to fit 7B in 40GB
+  gradient_accumulation_steps: 16     # effective batch = 16x2x1024 = 32768 tok/step
+  seq_len: 1024                       # Reduced from 2048 to fit VRAM
 
   # Learning rates
   int2_lr: 0.1             # Per hysteresis update
