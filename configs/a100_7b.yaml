@@ -39,9 +39,9 @@ mamba:
 # Training
 training:
   max_steps: 50000
-  batch_size: 2                       # batch=2 to fit 7B in 40GB
-  gradient_accumulation_steps: 16     # effective batch = 16x2x1024 = 32768 tok/step
-  seq_len: 1024                       # Reduced from 2048 to fit VRAM
+  batch_size: 4                       # Gradient checkpointing frees enough VRAM
+  gradient_accumulation_steps: 8      # effective batch = 8x4x2048 = 65536 tok/step
+  seq_len: 2048                       # Full context with checkpointing
 
   # Learning rates
   int2_lr: 0.1             # Per hysteresis update
@@ -64,7 +64,7 @@ optimizations:
   use_deepspeed: false
   use_zero: false
   cpu_offload: false
-  gradient_checkpointing: false
+  gradient_checkpointing: true   # Per-layer checkpointing for 7B model
   use_8bit_adamw: false
 
   # Enabled

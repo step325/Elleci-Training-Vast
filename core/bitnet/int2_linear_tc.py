@@ -62,7 +62,7 @@ class Int2LinearTCFunction(Function):
         """
         Forward pass: Y = X @ W.T * gamma (using Tensor Cores)
         """
-        ctx.save_for_backward(X, W_packed, gamma)
+        ctx.save_for_backward(W_packed, gamma)
         ctx.K = K
         ctx.gamma_cached = gamma_cached
 
@@ -80,7 +80,7 @@ class Int2LinearTCFunction(Function):
         """
         Backward pass: compute dX = dY @ W (using Tensor Cores)
         """
-        X, W_packed, gamma = ctx.saved_tensors
+        W_packed, gamma = ctx.saved_tensors
         K = ctx.K
 
         dX = None

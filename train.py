@@ -613,6 +613,11 @@ def main():
         enable_offload=enable_offload
     ).to(device)
 
+    # Gradient checkpointing (per-layer): trades compute for VRAM
+    if config["optimizations"].get("gradient_checkpointing", False):
+        model.gradient_checkpointing_enable()
+        print("Gradient checkpointing: enabled (per-layer)")
+
     # Stats modello
     total_params = sum(p.numel() for p in model.parameters())
     int2_layers = get_int2_layers(model)
