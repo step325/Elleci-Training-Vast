@@ -22,7 +22,7 @@ if not torch.cuda.is_available():
     exit(1)
 major, minor = torch.cuda.get_device_capability()
 print(f'CUDA capability: sm_{major}{minor}')
-vram = torch.cuda.get_device_properties(0).total_mem / 1e9
+vram = torch.cuda.get_device_properties(0).total_memory / 1e9
 print(f'VRAM: {vram:.1f} GB')
 if vram < 35:
     print('WARNING: Less than 35GB VRAM. Use configs/rtx4070_s.yaml instead.')
