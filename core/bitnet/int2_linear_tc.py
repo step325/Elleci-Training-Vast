@@ -189,23 +189,28 @@ class Int2LinearTC(nn.Module):
         self._initialized = True
 
     def _pack_int2_cpu(self, w_ternary: torch.Tensor):
-        """CPU fallback for packing."""
+        """Vectorized CPU packing (no Python loops)."""
+        import numpy as np
         N, K = w_ternary.shape
         packed_K = (K + 3) // 4
-        packed = torch.zeros(N, packed_K, dtype=torch.uint8, device=w_ternary.device)
 
-        w_cpu = w_ternary.cpu().numpy()
-        packed_cpu = packed.cpu().numpy()
+        w_cpu = w_ternary.cpu().numpy().astype(np.int8)
+        # Encode: {-1,0,+1} → {0,1,2}
+        encoded = (w_cpu + 1).astype(np.uint8)
 
-        for n in range(N):
-            for k in range(K):
-                byte_idx = k // 4
-                bit_offset = (k % 4) * 2
-                val = int(w_cpu[n, k])
-                encoded = val + 1
-                packed_cpu[n, byte_idx] |= (encoded << bit_offset)
+        # Pad K to multiple of 4
+        pad = packed_K * 4 - K
+        if pad > 0:
+            encoded = np.pad(encoded, ((0, 0), (0, pad)), constant_values=0)
 
-        self.W_packed.copy_(torch.from_numpy(packed_cpu).to(w_ternary.device))
+        # Reshape to (N, packed_K, 4) and pack 4 values per byte
+        encoded = encoded.reshape(N, packed_K, 4)
+        packed_cpu = (encoded[:, :, 0] |
+                      (encoded[:, :, 1] << 2) |
+                      (encoded[:, :, 2] << 4) |
+                      (encoded[:, :, 3] << 6))
+
+        self.W_packed.copy_(torch.from_numpy(packed_cpu.astype(np.uint8)).to(w_ternary.device))
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass using TC-optimized matmul."""
