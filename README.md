@@ -6,7 +6,7 @@ Hybrid LLM: Mamba-2 SSD + Differential Attention + EG-MLA + BitNet INT2.
 
 ```bash
 # 1. Clone
-git clone <repo-url> && cd elleci-train
+git clone https://github.com/step325/Elleci-Training-Vast.git && cd elleci-train
 
 # 2. Setup (installs deps, compiles CUDA kernels, runs dry-run test)
 chmod +x setup.sh && ./setup.sh
@@ -45,3 +45,4 @@ python3 train.py --resume checkpoints/7b_training/step_5000.pt  # Resume
 | Optimizer (AdamW for FP32) | 3.6 |
 | Temporary | 2.0 |
 | **Total** | **~26.5 / 40** |
+
