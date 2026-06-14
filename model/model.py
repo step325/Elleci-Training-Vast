@@ -124,6 +124,9 @@ class ElleciBlock(nn.Module):
         self.use_mamba = use_mamba
         self.layer_idx = layer_idx
 
+        # ProRes: scalare residuale, cresce 0→1 durante warmup (aggiornato dal trainer)
+        self.register_buffer('residual_alpha', torch.tensor(1.0))
+
         # v2 flags
         use_v2 = getattr(config, 'use_v2', False)
         use_moe = getattr(config, 'use_moe', False)
@@ -211,26 +214,26 @@ class ElleciBlock(nn.Module):
         present_kv = None
         present_mamba_state = None
 
-        # Attention + dropout + residual
+        # Attention + dropout + residual (ProRes alpha applied in BOTH train and cache paths)
         if use_cache:
             if self.use_mamba:
                 # Mamba with state caching
                 attn_out, present_mamba_state = self.attn(
                     self.norm1(x), use_cache=True, past_state=past_mamba_state
                 )
-                x = x + self.dropout(attn_out)
+                x = x + self.residual_alpha * self.dropout(attn_out)
             else:
                 # MLA/EGMLA with KV caching
                 attn_out, present_kv = self.attn(
                     self.norm1(x), use_cache=True, past_kv=past_kv
                 )
-                x = x + self.dropout(attn_out)
+                x = x + self.residual_alpha * self.dropout(attn_out)
         else:
-            # No caching
-            x = x + self.dropout(self.attn(self.norm1(x)))
+            # No caching (training)
+            x = x + self.residual_alpha * self.dropout(self.attn(self.norm1(x)))
 
-        # FFN + dropout + residual
-        x = x + self.dropout(self.ffn(self.norm2(x)))
+        # FFN + dropout + residual (scalato da ProRes)
+        x = x + self.residual_alpha * self.dropout(self.ffn(self.norm2(x)))
 
         if use_cache:
             return x, present_kv, present_mamba_state
@@ -241,6 +244,10 @@ class ElleciBlock(nn.Module):
         if self.is_moe and hasattr(self.ffn, 'aux_loss'):
             return self.ffn.aux_loss
         return None
+
+    def set_residual_alpha(self, alpha: float):
+        """Aggiorna il fattore di scaling residuale (usato da ProRes durante warmup)."""
+        self.residual_alpha.fill_(alpha)
 
 
 class Elleci(nn.Module):
@@ -406,14 +413,22 @@ class Elleci(nn.Module):
                 x = (x_slow * p_slow) + (x_fast * p_fast)
         else:
             # Default: use main blocks without routing
-            # Default: use main blocks without routing
             for block in self.blocks:
                 if self.gradient_checkpointing and self.training:
                     # Use checkpointing to save VRAM (trades compute for memory)
                     x = torch.utils.checkpoint.checkpoint(block, x, use_reentrant=False)
                 else:
                     x = block(x)
-        
+
+        # Collect MoE auxiliary loss (load balancing, DPSL, SPR, ERC)
+        # MoEFFN stores aux_loss internally on each forward; sum across MoE blocks.
+        moe_aux_loss = None
+        if self.training:
+            for block in self.blocks:
+                aux = block.get_aux_loss()
+                if aux is not None:
+                    moe_aux_loss = aux if moe_aux_loss is None else moe_aux_loss + aux
+
         # Output normalization
         x = self.norm_f(x)
         
@@ -464,10 +479,14 @@ class Elleci(nn.Module):
                 loss = main_loss + load_balance_loss
             else:
                 loss = main_loss
-            
+
             # Add PonderNet loss if enabled
             if ponder_loss is not None:
                 loss = loss + ponder_loss
+
+            # Add MoE auxiliary loss (load balancing across experts)
+            if moe_aux_loss is not None:
+                loss = loss + moe_aux_loss
         else:
             logits = self.lm_head(x)  # Only compute logits if no targets (inference)
         

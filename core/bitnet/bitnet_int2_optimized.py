@@ -43,6 +43,49 @@ except (ImportError, ValueError):
 _OFFLOAD_MANAGER_SETUP = False
 
 
+def _is_pow2(k: int) -> bool:
+    return k > 0 and (k & (k - 1)) == 0
+
+
+def _hadamard_smooth(x: torch.Tensor) -> torch.Tensor:
+    """Walsh-Hadamard transform sull'ultima dim (paper BitNet v2, arxiv 2504.18415).
+
+    Smooth-a gli outlier prima della quantizzazione INT2/INT8 senza alterare
+    il prodotto X @ W^T se applicata coerentemente anche ai pesi.
+    Richiede shape[-1] potenza di 2.
+    """
+    K = x.shape[-1]
+    assert _is_pow2(K), f"Hadamard requires pow2 last dim, got {K}"
+    result = x.clone()
+    step = 1
+    while step < K:
+        n_groups = K // (2 * step)
+        r = result.view(*result.shape[:-1], n_groups, 2, step)
+        a = r[..., 0, :].clone()
+        b = r[..., 1, :].clone()
+        r_new = torch.stack([a + b, a - b], dim=-2)
+        result = r_new.view(*result.shape[:-3], K)
+        step <<= 1
+    return result / (K ** 0.5)
+
+
+class _ExtraRMSNorm(nn.Module):
+    """RMSNorm applicata pre-linear (paper arxiv 2505.08823).
+
+    Smooth-a le attivazioni prima della quantizzazione INT8 per recuperare
+    il gap ternario↔FP16. Calcolo in FP32 per stabilita numerica.
+    """
+    def __init__(self, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.eps = eps
+        self.weight = nn.Parameter(torch.ones(dim))
+
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        x_f32 = x.float()
+        norm = x_f32 * torch.rsqrt(x_f32.pow(2).mean(-1, keepdim=True) + self.eps)
+        return norm.type_as(x) * self.weight.type_as(x)
+
+
 def setup_offload_manager(num_layers: int = 128):
     """Setup the CPU offload manager (call once before creating model)."""
     global _OFFLOAD_MANAGER_SETUP
@@ -84,12 +127,26 @@ class BitLinearInt2(nn.Module):
         lr_scale: float = 5.0,
         decay_rate: float = 0.001,
         use_grad_hook: bool = True,
-        enable_offload: bool = True  # Enable CPU offload
+        enable_offload: bool = True,  # Enable CPU offload
+        use_24_sparsity: bool = False,  # Sparse-BitNet: 2:4 structured sparsity
+        use_hadamard_int4: bool = False,  # BitNet v2: Hadamard+INT4 activations
+        use_extra_rmsnorm: bool = True,  # arxiv 2505.08823: RMSNorm pre-linear
+        rmsnorm_eps: float = 1e-6,
+        use_hadamard_smooth: bool = False  # arxiv 2504.18415: Hadamard pre-quant (richiede in_features pow2)
     ):
         super().__init__()
 
         self.in_features = in_features
         self.out_features = out_features
+
+        self.use_extra_rmsnorm = use_extra_rmsnorm
+        if use_extra_rmsnorm:
+            self.extra_rmsnorm = _ExtraRMSNorm(in_features, eps=rmsnorm_eps)
+
+        # Hadamard smoothing — auto-skip se in_features non e pow2
+        self.use_hadamard_smooth = use_hadamard_smooth and _is_pow2(in_features)
+        if use_hadamard_smooth and not _is_pow2(in_features):
+            print(f"[BitLinearInt2] ⚠ use_hadamard_smooth disabilitato per in_features={in_features} (non pow2)")
 
         # Setup offload manager if not done
         if USING_OPTIMIZED and enable_offload and not _OFFLOAD_MANAGER_SETUP:
@@ -105,7 +162,9 @@ class BitLinearInt2(nn.Module):
                 threshold=threshold,
                 lr_scale=lr_scale,
                 decay_rate=decay_rate,
-                enable_offload=enable_offload
+                enable_offload=enable_offload,
+                use_24_sparsity=use_24_sparsity,
+                use_hadamard_int4=use_hadamard_int4
             )
         else:
             LayerClass = Int2LinearWithGradHook if use_grad_hook else Int2Linear
@@ -115,7 +174,9 @@ class BitLinearInt2(nn.Module):
                 bias=bias,
                 threshold=threshold,
                 lr_scale=lr_scale,
-                decay_rate=decay_rate
+                decay_rate=decay_rate,
+                use_24_sparsity=use_24_sparsity,
+                use_hadamard_int4=use_hadamard_int4
             )
 
         # Per compatibilità con BitNetLinear
@@ -139,7 +200,10 @@ class BitLinearInt2(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         """Forward pass."""
-        # Int2Linear kernels need float16
+        if self.use_extra_rmsnorm:
+            x = self.extra_rmsnorm(x)
+        if self.use_hadamard_smooth:
+            x = _hadamard_smooth(x)
         if x.dtype != torch.float16:
             x = x.half()
         out = self.int2_layer(x)
@@ -169,6 +233,10 @@ class BitLinearInt2(nn.Module):
         )
         nn.init.kaiming_normal_(w_init, mode='fan_in', nonlinearity='linear')
 
+        # Hadamard pre-transform pesi se attivo (W' = W @ H^T per coerenza con X @ H online)
+        if self.use_hadamard_smooth:
+            w_init = _hadamard_smooth(w_init)
+
         # Calcola scale
         scale = w_init.abs().mean().item()
         scale = max(scale, 1e-5)
@@ -180,7 +248,7 @@ class BitLinearInt2(nn.Module):
         )
 
     @classmethod
-    def from_bitnetlinear(cls, bitlinear: nn.Module, **kwargs) -> 'BitLinearInt2':
+    def from_bitnetlinear(cls, bitlinear: nn.Module, use_24_sparsity: bool = False, **kwargs) -> 'BitLinearInt2':
         """
         Converte un BitNetLinear esistente in BitLinearInt2.
 
@@ -201,6 +269,7 @@ class BitLinearInt2(nn.Module):
             in_features=bitlinear.in_features,
             out_features=bitlinear.out_features,
             bias=bitlinear.bias is not None,
+            use_24_sparsity=use_24_sparsity,
             **kwargs
         ).to(device)
 
@@ -223,6 +292,10 @@ class BitLinearInt2(nn.Module):
                 )
                 nn.init.kaiming_normal_(weight, mode='fan_in', nonlinearity='linear')
                 scale = 1.0 / math.sqrt(bitlinear.in_features)
+
+            # Hadamard pre-transform se attivo (coerenza con X @ H online)
+            if new_layer.use_hadamard_smooth:
+                weight = _hadamard_smooth(weight)
 
             # Assicura scale valido
             if scale is None:
@@ -256,7 +329,8 @@ def convert_bitnetlinear_to_int2(
     decay_rate: float = 0.001,
     use_grad_hook: bool = True,
     enable_offload: bool = True,
-    inplace: bool = False
+    inplace: bool = False,
+    use_24_sparsity: bool = False  # Sparse-BitNet: 2:4 structured sparsity
 ) -> nn.Module:
     """
     Converte ricorsivamente tutti i BitNetLinear in BitLinearInt2 ottimizzato.
@@ -287,7 +361,8 @@ def convert_bitnetlinear_to_int2(
                 lr_scale=lr_scale,
                 decay_rate=decay_rate,
                 use_grad_hook=use_grad_hook,
-                enable_offload=enable_offload
+                enable_offload=enable_offload,
+                use_24_sparsity=use_24_sparsity
             )
             setattr(module, name, new_child)
         else:
@@ -299,7 +374,8 @@ def convert_bitnetlinear_to_int2(
                 decay_rate=decay_rate,
                 use_grad_hook=use_grad_hook,
                 enable_offload=enable_offload,
-                inplace=True
+                inplace=True,
+                use_24_sparsity=use_24_sparsity
             )
 
     return module
@@ -376,7 +452,7 @@ def _should_exclude_layer(name: str, module: nn.Module, min_size: int = 256,
     if exclude_patterns is None:
         exclude_patterns = [
             'lm_head',
-            'embed', 'token_emb', 'wte', 'wpe', 'word_emb',
+            'embed_tokens', 'token_emb', 'wte', 'wpe', 'word_emb',
             'norm', 'ln_', 'layer_norm', 'rmsnorm',
             'bias',
         ]
@@ -410,7 +486,9 @@ def convert_all_linear_to_int2(
     min_size: int = 256,
     exclude_patterns: list = None,
     inplace: bool = False,
-    verbose: bool = True
+    verbose: bool = True,
+    use_24_sparsity: bool = False,  # Sparse-BitNet: 2:4 structured sparsity
+    use_hadamard_int4: bool = False  # BitNet v2: Hadamard+INT4 activations
 ) -> nn.Module:
     """
     Converte TUTTI i layer lineari (nn.Linear e BitNetLinear) a INT2 OTTIMIZZATO.
@@ -480,7 +558,9 @@ def convert_all_linear_to_int2(
             lr_scale=lr_scale,
             decay_rate=decay_rate,
             use_grad_hook=use_grad_hook,
-            enable_offload=enable_offload
+            enable_offload=enable_offload,
+            use_24_sparsity=use_24_sparsity,
+            use_hadamard_int4=use_hadamard_int4
         ).to(device)
 
         with torch.no_grad():
@@ -512,7 +592,9 @@ def convert_all_linear_to_int2(
                         lr_scale=lr_scale,
                         decay_rate=decay_rate,
                         use_grad_hook=use_grad_hook,
-                        enable_offload=enable_offload
+                        enable_offload=enable_offload,
+                        use_24_sparsity=use_24_sparsity,
+                        use_hadamard_int4=use_hadamard_int4
                     )
                     setattr(mod, name, new_child)
                     params = child.in_features * child.out_features

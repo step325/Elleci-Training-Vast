@@ -13,8 +13,21 @@
 #include <cuda_runtime.h>
 #include <mma.h>
 #include <cstdint>
+#include <cstdio>
+
+#include "int2_packed.cuh"
 
 using namespace nvcuda;
+
+#ifndef CUDA_CHECK
+#define CUDA_CHECK(call) do { \
+    cudaError_t err = (call); \
+    if (err != cudaSuccess) { \
+        fprintf(stderr, "CUDA error %s:%d: %s\n", __FILE__, __LINE__, cudaGetErrorString(err)); \
+        return; \
+    } \
+} while (0)
+#endif
 
 // ============================================================
 // WMMA Configuration
@@ -46,11 +59,10 @@ using namespace nvcuda;
  * INT2 encoding: 00 = -1, 01 = 0, 10 = +1, 11 = reserved (treated as 0)
  */
 __device__ __forceinline__ void expand_int2_x4(uint8_t packed, half out[4]) {
-    // Decode each 2-bit value: encoded - 1 gives the actual weight
-    int8_t w0 = ((packed >> 0) & 0x3) - 1;
-    int8_t w1 = ((packed >> 2) & 0x3) - 1;
-    int8_t w2 = ((packed >> 4) & 0x3) - 1;
-    int8_t w3 = ((packed >> 6) & 0x3) - 1;
+    int8_t w0 = bitpack::decode_int2_bits((packed >> 0) & 0x3);
+    int8_t w1 = bitpack::decode_int2_bits((packed >> 2) & 0x3);
+    int8_t w2 = bitpack::decode_int2_bits((packed >> 4) & 0x3);
+    int8_t w3 = bitpack::decode_int2_bits((packed >> 6) & 0x3);
 
     out[0] = __float2half((float)w0);
     out[1] = __float2half((float)w1);
@@ -106,13 +118,14 @@ int2_matmul_tc_kernel(
 
     // ========== Accumulator Fragments ==========
     // Each warp computes 2x2 WMMA tiles = 32x32 output
-    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, half> acc[2][2];
+    // R4: accumulo FP32 (mma half×half → float) — preciso su K grande, costo ~zero su Ada.
+    wmma::fragment<wmma::accumulator, WMMA_M, WMMA_N, WMMA_K, float> acc[2][2];
 
     #pragma unroll
     for (int i = 0; i < 2; i++) {
         #pragma unroll
         for (int j = 0; j < 2; j++) {
-            wmma::fill_fragment(acc[i][j], __float2half(0.0f));
+            wmma::fill_fragment(acc[i][j], 0.0f);
         }
     }
 
@@ -230,41 +243,42 @@ int2_matmul_tc_kernel(
     }
 
     // ========== Apply Gamma and Store ==========
-    // Use separate output buffer per warp to avoid race conditions
-    // 4 warps × 16×24 (padded) = 1536 half = 3 KB shared memory
-    __shared__ half out_tiles[4][WMMA_M][WMMA_N + 8];
+    // R4: out_tiles in FP32 (l'accumulatore è float); gamma + conversione a half allo store.
+    __shared__ float out_tiles[4][WMMA_M][WMMA_N + 8];
 
     #pragma unroll
     for (int mi = 0; mi < 2; mi++) {
         #pragma unroll
         for (int ni = 0; ni < 2; ni++) {
-            // Apply gamma scaling to accumulator
-            #pragma unroll
-            for (int t = 0; t < acc[mi][ni].num_elements; t++) {
-                float val = __half2float(acc[mi][ni].x[t]) * gamma;
-                acc[mi][ni].x[t] = __float2half(val);
-            }
-
             // Calculate output position
             int out_m = block_m + warp_m * 32 + mi * WMMA_M;
             int out_n = block_n + warp_n * 32 + ni * WMMA_N;
 
-            // Store to warp-local shared memory buffer
+            // R1: read-back del tile precedente completo prima di riscrivere out_tiles (WAR).
+            __syncwarp();
             wmma::store_matrix_sync(&out_tiles[warp_id][0][0], acc[mi][ni],
                 WMMA_N + 8, wmma::mem_row_major);
-
             __syncwarp();
 
-            // Copy to global with bounds checking
-            // Each lane handles part of the 16x16 tile
-            for (int idx = lane_id; idx < WMMA_M * WMMA_N; idx += WARP_SIZE) {
-                int m_idx = idx / WMMA_N;
-                int n_idx = idx % WMMA_N;
-                int m_out = out_m + m_idx;
-                int n_out = out_n + n_idx;
+            int row = lane_id / 2;
+            int col_chunk = lane_id % 2;
+            int m_out = out_m + row;
+            int n_out = out_n + col_chunk * 8;
 
-                if (m_out < M && n_out < N) {
-                    Y[m_out * N + n_out] = out_tiles[warp_id][m_idx][n_idx];
+            // float4 (16B) richiede Y[m_out*N+n_out] allineato a 16B: n_out è già
+            // multiplo di 8, quindi serve N%8==0 (altrimenti m_out*N disallinea).
+            if ((N % 8 == 0) && m_out < M && n_out + 7 < N) {
+                half out_vec[8];
+                #pragma unroll
+                for (int i = 0; i < 8; i++) {
+                    out_vec[i] = __float2half(out_tiles[warp_id][row][col_chunk * 8 + i] * gamma);
+                }
+                *reinterpret_cast<float4*>(&Y[m_out * N + n_out]) = *reinterpret_cast<float4*>(&out_vec[0]);
+            } else {
+                for (int i = 0; i < 8; i++) {
+                    if (m_out < M && n_out + i < N) {
+                        Y[m_out * N + n_out + i] = __float2half(out_tiles[warp_id][row][col_chunk * 8 + i] * gamma);
+                    }
                 }
             }
         }
@@ -300,7 +314,7 @@ __global__ void int2_matmul_tc_simple_kernel(
         int byte_idx = k / 4;
         int bit_offset = (k % 4) * 2;
         uint8_t packed = W_packed[n * packed_K + byte_idx];
-        int8_t w_val = ((packed >> bit_offset) & 0x3) - 1;
+        int8_t w_val = bitpack::decode_int2_bits((packed >> bit_offset) & 0x3);
 
         sum += x_val * (float)w_val;
     }
@@ -345,6 +359,7 @@ void int2_matmul_tc(
         int2_matmul_tc_kernel<<<grid, block, 0, stream>>>(
             X, W_packed, Y, gamma, M, N, K
         );
+        CUDA_CHECK(cudaGetLastError());
     } else {
         // Use simple kernel for small matrices
         dim3 block(16, 16);
@@ -353,6 +368,7 @@ void int2_matmul_tc(
         int2_matmul_tc_simple_kernel<<<grid, block, 0, stream>>>(
             X, W_packed, Y, gamma, M, N, K
         );
+        CUDA_CHECK(cudaGetLastError());
     }
 }
 

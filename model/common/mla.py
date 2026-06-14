@@ -48,10 +48,11 @@ class MLASelfAttention(nn.Module):
         
         # RoPE (Rotary Position Embedding) - 128k context support
         rope_base = getattr(config, 'rope_base', 100000)
+        rope_max_seq_len = getattr(config, 'max_seq_len', 8192)
         self.rotary_emb = RotaryEmbedding(
-            dim=self.head_dim, 
+            dim=self.head_dim,
             base=rope_base,
-            max_seq_len=8192
+            max_seq_len=rope_max_seq_len
         )
         
     def forward(self, x, mask=None, use_cache=False, past_kv=None):

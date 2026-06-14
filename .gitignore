@@ -3,6 +3,8 @@ __pycache__/
 *.pt
 *.bin
 *.safetensors
+*.so
+*.o
 checkpoints/
 log/
 wandb/
@@ -11,3 +13,7 @@ wandb/
 *.egg-info/
 dist/
 build/
+.env
+secrets.sh
+.venv/
+venv/

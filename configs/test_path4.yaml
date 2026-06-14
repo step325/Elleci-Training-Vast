@@ -1,0 +1,71 @@
+# Test config: verifica che Path 4 (accelerated_scan) non vada OOM su A100 40GB.
+# Lancia 5 step con batch ridotto per stimare VRAM peak.
+# Usare con: python3 train_fp16.py --config configs/test_path4.yaml --no-wandb
+#
+# Se VRAM < 37 GB e nessun OOM → Path 4 è sicuro.
+# Poi applicare a100_3b_fp16.yaml (già aggiornato con use_matmul_ssd=false).
+
+model:
+  d_model: 2560
+  n_layers: 32
+  n_heads: 32
+  vocab_size: 32128
+  max_seq_len: 2048
+  use_moe: false
+  use_int2: false
+
+mamba:
+  use_matmul_ssd: false     # Path 4: accelerated_scan
+  use_checkpointing: false  # No chunk checkpointing
+  use_cuda_ssd: false
+  chunk_size: 32
+  n_heads: 16
+  d_state: 16
+  expand: 2
+
+training:
+  max_steps: 5              # Solo 5 step per test memoria
+  batch_size: 8
+  gradient_accumulation_steps: 4
+  seq_len: 2048
+  phase1_end_step: 35000
+  phase2_end_step: 50000
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  warmup_steps: 2000
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+  mixed_precision: "bf16"
+  max_grad_norm: 1.0
+  enable_offload: false
+
+data:
+  tokenizer_path: "tokenizer/tokenizer.json"
+  streaming: true
+  seed: 42
+
+optimizations:
+  use_deepspeed: false
+  use_zero: false
+  cpu_offload: false
+  use_liger_cross_entropy: true
+  use_liger_rmsnorm: true
+  compile_model: false
+
+logging:
+  log_interval: 1           # Log ogni step (5 step totali)
+  eval_interval: 10
+  save_interval: 100
+  wandb_project: "elleci-test"
+  wandb_run_name: "test-path4"
+
+checkpointing:
+  output_dir: "checkpoints/test_path4"
+  save_total_limit: 1
+  resume_from: null
+
+evaluation:
+  eval_samples: 10
+  max_new_tokens: 10

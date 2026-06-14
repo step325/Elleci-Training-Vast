@@ -63,7 +63,9 @@ class Int2LinearTCOffload(Int2LinearTC):
         lr_scale: float = 5.0,
         decay_rate: float = 0.001,
         compress_activations: bool = True,  # Phase 2: Always use INT8
-        enable_offload: bool = True  # Phase 4: CPU offload
+        enable_offload: bool = True,  # Phase 4: CPU offload
+        use_24_sparsity: bool = False,  # Sparse-BitNet: 2:4 structured sparsity
+        use_hadamard_int4: bool = False  # BitNet v2: Hadamard+INT4 (vs INT8)
     ):
         """
         Initialize Int2LinearTC with offload support.
@@ -77,6 +79,7 @@ class Int2LinearTCOffload(Int2LinearTC):
             decay_rate: Decay rate for hysteresis
             compress_activations: Use INT8 activation compression (Phase 2)
             enable_offload: Enable CPU offload for saved activations
+            use_hadamard_int4: BitNet v2 Hadamard+INT4 activation quantization
         """
         # Force compress_activations=True for offload (INT8 is required)
         super().__init__(
@@ -86,7 +89,9 @@ class Int2LinearTCOffload(Int2LinearTC):
             threshold=threshold,
             lr_scale=lr_scale,
             decay_rate=decay_rate,
-            compress_activations=True  # Required for offload
+            compress_activations=True,  # Required for offload
+            use_24_sparsity=use_24_sparsity,
+            use_hadamard_int4=use_hadamard_int4
         )
 
         self.enable_offload = enable_offload
@@ -257,6 +262,19 @@ class Int2LinearTCOffload(Int2LinearTC):
                 self._step_py
             )
 
+
+        # Sparse-BitNet: applica sparsità 2:4 dopo hysteresis update
+        if self.use_24_sparsity:
+            try:
+                from int2_linear_tc import apply_24_sparsity
+            except ImportError:
+                from .int2_linear_tc import apply_24_sparsity
+            W_fp16 = torch.empty(self.out_features, self.in_features,
+                                 dtype=torch.float16, device=self.W_packed.device)
+            int2_tc_ops.unpack_int2(self.W_packed, W_fp16, self.in_features)
+            W_sparse_fp16 = apply_24_sparsity(W_fp16)
+            W_sparse_int8 = W_sparse_fp16.round().clamp(-1, 1).to(torch.int8).cpu()
+            self._pack_int2_cpu(W_sparse_int8)
 
         # Clear saved state
         self._saved_input = None

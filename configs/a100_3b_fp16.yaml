@@ -1,0 +1,104 @@
+# Elleci 3B - FP16/BF16 Standard Training - A100 40GB
+#
+# Training strategy: FP16 standard (no INT2).
+# BitLinear layers train as FP16 via STE (ternary quant simulated during forward).
+# Post-training: convert to true INT2 for inference (saves 4x VRAM).
+#
+# VRAM Budget (A100 40GB):
+#   Model bf16 (~2.7B):              ~5.4 GB
+#   Gradients bf16:                  ~5.4 GB
+#   AdamW fp32 (m + v):             ~21.6 GB
+#   Static subtotal:                ~32.4 GB
+#   Activations (accelerated_scan):  ~2-4 GB  (no M matrix, O(cs) memory)
+#   TOTAL:                          ~34-36 GB  ← fits A100 40GB
+#
+# NOTE: Path 4 (accelerated_scan, use_matmul_ssd=false, use_checkpointing=false).
+# No chunk-level checkpointing needed: accelerated_scan has O(cs) memory, no M matrix.
+# Expected throughput: ~1,200-1,800 tok/s (vs ~600 tok/s with chunk checkpointing).
+
+model:
+  d_model: 2560
+  n_layers: 32
+  n_heads: 32           # MLA heads: 2560/32 = 80 head_dim
+  vocab_size: 32128
+  max_seq_len: 2048
+  use_moe: false        # Base 3B: no MoE (simpler, more stable)
+  use_int2: false       # FP16 training (no INT2 conversion)
+
+mamba:
+  use_matmul_ssd: false     # Path 4: accelerated_scan (O(cs) memory, 2-3x faster)
+  use_checkpointing: false  # No chunk checkpointing needed: no M matrix OOM risk
+  use_cuda_ssd: false       # Disabled: use accelerated_scan Triton kernel
+  chunk_size: 32            # Smaller chunks: lower VRAM peak per layer
+  n_heads: 16               # Mamba heads: d_inner=5120, head_dim=320
+  d_state: 16
+  expand: 2
+
+training:
+  max_steps: 50000
+  batch_size: 8                      # Per-GPU micro batch
+  gradient_accumulation_steps: 4
+  # effective_batch = 8 * 4 = 32 sequences = 32 * 2048 = 65,536 tok/step
+  seq_len: 2048
+
+  # Phase curriculum (step thresholds)
+  phase1_end_step: 35000   # Steps 0-35K: English foundation
+  phase2_end_step: 50000   # Steps 35K-50K: Italian knowledge
+  # Phase 3 (instructions) can be added as a separate fine-tuning run
+
+  # Learning rate (cosine decay with warmup)
+  lr: 3.0e-4
+  min_lr: 3.0e-5
+  warmup_steps: 2000
+  weight_decay: 0.1
+  beta1: 0.9
+  beta2: 0.95
+  eps: 1.0e-8
+
+  # Mixed precision
+  mixed_precision: "bf16"    # bf16 preferred (no GradScaler needed, more stable)
+
+  # Gradient
+  max_grad_norm: 1.0
+
+  # CPU offload for activations (disabled: Mamba checkpointing is enough)
+  enable_offload: false
+
+data:
+  tokenizer_path: "tokenizer/tokenizer.json"
+  streaming: true
+  seed: 42
+
+optimizations:
+  use_deepspeed: false
+  use_zero: false
+  cpu_offload: false
+  use_liger_cross_entropy: true
+  use_liger_rmsnorm: true
+  compile_model: false      # torch.compile may conflict with custom Mamba variants
+
+logging:
+  log_interval: 50
+  eval_interval: 1000
+  save_interval: 5000
+  wandb_project: "elleci-3b-fp16"
+  wandb_run_name: "3b-fp16-a100-50k"
+
+checkpointing:
+  output_dir: "checkpoints/fp16_3b"
+  save_total_limit: 5
+  resume_from: null
+
+evaluation:
+  eval_samples: 200     # Synthetic batches for perplexity estimate
+  max_new_tokens: 50    # Tokens to generate at eval time
+
+# --- Throughput Estimates (A100 40GB) ---
+# Model: ~2.7B params in bf16
+# Batch: 8 seq × 2048 tokens = 16,384 tok/micro-step
+# Effective: 65,536 tok/optimizer-step
+# Expected throughput: 2,000-3,500 tok/s
+# Total tokens: 50K × 65,536 = 3.3B tokens
+# Estimated time at 2,500 tok/s: ~370 hours (15 days)
+# At 3,500 tok/s: ~260 hours (11 days)
+# Vast.ai cost @ $1.20/hr: ~$310-$440

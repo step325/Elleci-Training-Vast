@@ -3,6 +3,7 @@ import torch
 import torch.nn as nn
 from torch.utils.cpp_extension import load
 import os
+import warnings
 
 
 # Paths
@@ -55,14 +56,52 @@ class Mamba2SSDFunction(torch.autograd.Function):
         x, dt, A, B, C = ctx.saved_tensors
         grad_output = grad_output.contiguous()
         
+        # M1 risolto: il backward (mamba2_ssd.cpp) calcola dx/ddt/dA/dB/dC corretti
+        # via tensor-ops (verificato con gradcheck fp64, relerr ~1e-16).
         dx, ddt, dA, dB, dC = mamba2_ssd_cuda.backward(grad_output, x, dt, A, B, C)
-        
         return dx, ddt, dA, dB, dC
+
+# ---------------------------------------------------------------------------
+# Dominio di validità del kernel CUDA SSD (M3)
+# ---------------------------------------------------------------------------
+# Il kernel fuso (mamba2_ssd_kernel.cu) calcola SOLO il contributo intra-chunk
+# (blocco diagonale) e tratta dt come per-head (usa dt[...,0]). NON propaga lo
+# stato inter-chunk e NON supporta dt per-canale. È quindi corretto solo per
+# seqlen <= chunk_size con dt per-head. Per il training reale (seqlen >>
+# chunk_size, dt = dt_proj per canale) usare use_matmul_ssd / use_checkpointing.
+_CUDA_SSD_DT_WARNED = False
+
+
+def _check_cuda_ssd_domain(seqlen: int, chunk_size: int, dt: torch.Tensor) -> None:
+    """Fa fallire/avvisare quando il path CUDA SSD esce dal suo dominio corretto."""
+    global _CUDA_SSD_DT_WARNED
+    n_chunks = (seqlen + chunk_size - 1) // chunk_size
+    if n_chunks > 1:
+        raise NotImplementedError(
+            f"Mamba2 CUDA SSD: il kernel calcola solo il contributo INTRA-chunk "
+            f"(nessuno stato inter-chunk). seqlen={seqlen} > chunk_size={chunk_size} "
+            f"→ {n_chunks} chunk: i risultati sarebbero ERRATI. Disattiva use_cuda_ssd "
+            f"e usa use_matmul_ssd o use_checkpointing."
+        )
+    if dt.dim() == 4 and dt.shape[-1] > 1 and not _CUDA_SSD_DT_WARNED:
+        # dt_proj mappa n_heads→d_inner: dt è per-canale. Il kernel userà dt[...,0]
+        # (per-head) → perdita d'informazione se i canali differiscono.
+        _CUDA_SSD_DT_WARNED = True
+        if not torch.allclose(dt[..., :1].expand_as(dt), dt, rtol=1e-3, atol=1e-3):
+            warnings.warn(
+                "Mamba2 CUDA SSD: dt è per-canale (d_inner) ma il kernel usa dt[...,0] "
+                "(per-head) → risultati approssimati. Preferire use_matmul_ssd.",
+                RuntimeWarning, stacklevel=2,
+            )
+
 
 class Mamba2BlockCuda(Mamba2BlockMatmul):
     """
     Uses the Custom CUDA Kernel for the chunk_forward pass.
     Drastically reduces VRAM by recomputing 'M' in the backward pass.
+
+    ATTENZIONE (M3): valido solo per seqlen <= chunk_size con dt per-head.
+    Vedi _check_cuda_ssd_domain. Per il training reale usare use_matmul_ssd.
     """
     
     def chunked_ssd(self, x, dt, A, B, C, initial_state=None):
@@ -87,7 +126,8 @@ class Mamba2BlockCuda(Mamba2BlockMatmul):
         batch, seqlen, n_heads, head_dim = x.shape
         # Input seqlen is already padded to multiple of cs by method calling this
         assert seqlen % cs == 0, f"Seqlen {seqlen} must be multiple of chunk_size {cs}"
-        
+        _check_cuda_ssd_domain(seqlen, cs, dt)  # M3: intra-chunk + dt per-head only
+
         # Reshape to 5D for Kernel: [B, NC, CS, H, D]
         x_5d = rearrange(x, 'b (nc cs) h d -> b nc cs h d', cs=cs)
         
@@ -161,11 +201,12 @@ class DifferentialMamba2BlockCuda(DifferentialMamba2BlockMatmul):
         cs = self.chunk_size
         batch, seqlen, n_heads, head_dim = x.shape
         assert seqlen % cs == 0, f"Seqlen {seqlen} must be multiple of chunk_size {cs}"
-        
+        _check_cuda_ssd_domain(seqlen, cs, dt)  # M3: intra-chunk + dt per-head only
+
         # Reshape to 5D for Kernel: [B, NC, CS, H, D]
         x_5d = rearrange(x, 'b (nc cs) h d -> b nc cs h d', cs=cs)
         if dt.dim() == 4:
-             dt = dt[..., 0] 
+             dt = dt[..., 0]
         
         dt_5d = rearrange(dt, 'b (nc cs) h -> b nc cs h', cs=cs).to(x.dtype)
         B_5d = rearrange(B, 'b (nc cs) n -> b nc cs n', cs=cs).to(x.dtype)

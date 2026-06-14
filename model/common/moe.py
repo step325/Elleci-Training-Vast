@@ -22,7 +22,10 @@ from einops import rearrange, repeat
 import math
 from typing import Optional, Tuple, List
 from dataclasses import dataclass
-from .bitnet_triton import BitNetLinear
+try:
+    from .bitnet_triton import BitNetLinear
+except ImportError:
+    BitNetLinear = __import__('torch').nn.Linear  # Fallback: standard linear (FP16)
 
 
 @dataclass
@@ -38,6 +41,10 @@ class MoEConfig:
     # Router settings
     router_type: str = "top_k"  # "top_k" or "expert_choice"
     router_jitter: float = 0.0  # Noise for load balancing during training
+    # Latent Prototype Routing (ArXiv 2506.21328)
+    use_lpr: bool = False  # Enable LPR (near-perfect load balance via prototype clustering)
+    lpr_ema_decay: float = 0.999  # EMA decay for prototype update
+    lpr_temperature: float = 1.0  # Softmax temperature on cosine logits
     # Auxiliary losses
     aux_loss_weight: float = 0.01
     dpsl_prior: float = 0.125  # 1/8 for 8 experts (uniform)
@@ -227,6 +234,129 @@ class Router(nn.Module):
         return router_probs, top_k_indices, top_k_probs, aux_loss
 
 
+class LatentPrototypeRouter(nn.Module):
+    """Latent Prototype Routing (paper ArXiv 2506.21328).
+
+    Sostituisce il router lineare con un bank di prototype vectors appresi.
+    Routing logit = cosine_similarity(x, prototype) / temperature.
+    Prototype update via EMA durante training (no aux loss extra).
+
+    Riduce drasticamente lo squilibrio di carico (Gini 0.70 → < 0.10)
+    mantenendo l'interfaccia di Router (stesso return tuple).
+    """
+
+    def __init__(self, config: MoEConfig):
+        super().__init__()
+        self.config = config
+        self.d_model = config.d_model
+        self.num_experts = config.num_experts
+        self.top_k = config.top_k
+        self.jitter = config.router_jitter
+        self.ema_decay = config.lpr_ema_decay
+        self.temperature = config.lpr_temperature
+
+        # Prototype bank — initialized with small random unit-norm vectors.
+        proto = torch.randn(config.num_experts, config.d_model)
+        proto = F.normalize(proto, dim=-1)
+        self.prototypes = nn.Parameter(proto)
+
+        # Required for ERC loss compatibility: expose `.gate.weight`-like attribute.
+        # ERC reads `self.router.gate.weight` as proxy tokens.
+        self.gate = _PrototypeGateProxy(self.prototypes)
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        return_aux_loss: bool = True
+    ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[torch.Tensor]]:
+        batch, seq_len, d_model = x.shape
+
+        x_flat = x.reshape(-1, d_model)
+        x_norm = F.normalize(x_flat, dim=-1)
+        proto_norm = F.normalize(self.prototypes, dim=-1)
+
+        logits_flat = (x_norm @ proto_norm.t()) / self.temperature
+        logits = logits_flat.view(batch, seq_len, self.num_experts)
+
+        if self.training and self.jitter > 0:
+            logits = logits + torch.randn_like(logits) * self.jitter
+
+        router_probs = F.softmax(logits, dim=-1)
+
+        top_k_probs, top_k_indices = torch.topk(router_probs, self.top_k, dim=-1)
+        top_k_probs = top_k_probs / top_k_probs.sum(dim=-1, keepdim=True)
+
+        if self.training:
+            self._ema_update(x_flat.detach(), top_k_indices.view(-1, self.top_k))
+
+        aux_loss = None
+        if return_aux_loss:
+            # Riusa load-balance + DPSL + SPR identici a Router (compatibilita aux losses)
+            expert_mask = F.one_hot(top_k_indices, self.num_experts).float()
+            expert_mask = expert_mask.sum(dim=2)
+            tokens_per_expert = expert_mask.sum(dim=[0, 1])
+            f_i = tokens_per_expert / (batch * seq_len * self.top_k)
+            P_i = router_probs.mean(dim=[0, 1])
+            load_balance_loss = (f_i * P_i).sum() * self.num_experts
+
+            target_prior = torch.full(
+                (self.num_experts,), self.config.dpsl_prior, device=x.device
+            )
+            dpsl_loss = F.kl_div(P_i.log(), target_prior, reduction='sum')
+
+            spr_loss = torch.tensor(0.0, device=x.device)
+            if self.config.spr_loss_weight > 0:
+                total_tokens = batch * seq_len
+                max_spr_tokens = getattr(self.config, 'max_spr_tokens', 256)
+                if total_tokens > max_spr_tokens:
+                    indices = torch.randperm(total_tokens, device=x.device)[:max_spr_tokens]
+                    x_sample = x_flat[indices]
+                    router_sample = router_probs.view(total_tokens, -1)[indices]
+                else:
+                    x_sample = x_flat
+                    router_sample = router_probs.view(total_tokens, -1)
+                x_sample_n = F.normalize(x_sample, dim=-1)
+                input_sim = x_sample_n @ x_sample_n.t()
+                router_sample_n = F.normalize(router_sample, dim=-1)
+                routing_sim = router_sample_n @ router_sample_n.t()
+                spr_loss = F.mse_loss(routing_sim, input_sim.detach())
+
+            aux_loss = self.config.aux_loss_weight * (
+                load_balance_loss + dpsl_loss + self.config.spr_loss_weight * spr_loss
+            )
+
+        return router_probs, top_k_indices, top_k_probs, aux_loss
+
+    @torch.no_grad()
+    def _ema_update(self, x_flat: torch.Tensor, top_k_indices_flat: torch.Tensor):
+        # Update solo dal primo expert scelto (top-1 dominante).
+        primary = top_k_indices_flat[:, 0]
+        expert_mask = F.one_hot(primary, self.num_experts).to(x_flat.dtype)
+        counts = expert_mask.sum(dim=0)
+        sums = expert_mask.t() @ x_flat
+        active = counts > 0
+        if active.any():
+            means = sums[active] / counts[active].unsqueeze(-1)
+            self.prototypes.data[active].mul_(self.ema_decay).add_(
+                means, alpha=1.0 - self.ema_decay
+            )
+
+
+class _PrototypeGateProxy(nn.Module):
+    """Stub esposto come `.gate` per compatibilita con ERC loss.
+
+    ERC legge `router.gate.weight` per estrarre proxy tokens.
+    Su LPR, i proxy tokens sono i prototypes.
+    """
+    def __init__(self, prototypes: nn.Parameter):
+        super().__init__()
+        self._prototypes = prototypes
+
+    @property
+    def weight(self) -> torch.Tensor:
+        return self._prototypes
+
+
 class MoELayer(nn.Module):
     """
     Mixture of Experts layer with sparse activation.
@@ -242,8 +372,11 @@ class MoELayer(nn.Module):
         self.num_experts = config.num_experts
         self.top_k = config.top_k
 
-        # Router
-        self.router = Router(config)
+        # Router (LPR variant if abilitato, altrimenti router lineare classico)
+        if getattr(config, 'use_lpr', False):
+            self.router = LatentPrototypeRouter(config)
+        else:
+            self.router = Router(config)
 
         # Experts
         self.experts = nn.ModuleList([

@@ -20,9 +20,27 @@ import yaml
 from datetime import datetime
 from pathlib import Path
 
+# Load .env file from script directory (WANDB_API_KEY, HF_TOKEN, etc.)
+_env_file = Path(__file__).parent / ".env"
+if _env_file.exists():
+    for _line in _env_file.read_text().splitlines():
+        _line = _line.strip()
+        if _line and not _line.startswith("#") and "=" in _line:
+            _k, _v = _line.split("=", 1)
+            os.environ.setdefault(_k.strip(), _v.strip())
+
+# Riduce frammentazione CUDA allocator (risolve OOM su modelli grandi)
+os.environ.setdefault('PYTORCH_ALLOC_CONF', 'expandable_segments:True')
+
 import torch
 import torch.nn.functional as F
 from torch.amp import autocast, GradScaler
+
+# A100 TF32 fast path: speeds up FP32 residual matmul (Muon on 2D embedding/lm_head)
+# without affecting bf16 path used in autocast.
+torch.set_float32_matmul_precision('high')
+torch.backends.cuda.matmul.allow_tf32 = True
+torch.backends.cudnn.allow_tf32 = True
 
 # Aggiungi paths
 ROOT_DIR = Path(__file__).parent  # repo root (elleci-train/)
@@ -114,6 +132,73 @@ class SyntheticDataLoader:
         return self.num_batches
 
 
+def ns_step(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
+    """Ortogonalizza G via Newton-Schulz 5° ordine.
+
+    Produce una matrice con valori singolari ≈ 1.
+    Stabile per ~5 iterazioni. Gestisce tensori ndim>=2 (flatten→2D→reshape).
+    """
+    orig_shape = G.shape
+    orig_norm = G.norm()
+
+    # Appiattisci a 2D (gestisce conv weights 3D come (512,1,4))
+    G_2d = G.reshape(-1, G.shape[-1]) if G.ndim > 2 else G
+
+    X = G_2d / (orig_norm + 1e-8)
+    transposed = X.shape[0] > X.shape[1]
+    if transposed:
+        X = X.mT  # mT = transpose ultimi 2 dims (sicuro per ndim>=2)
+    for _ in range(steps):
+        A = X @ X.mT
+        X = (15/8) * X - (10/8) * (A @ X) + (3/8) * (A @ A @ X)
+    if transposed:
+        X = X.mT
+    return (X * orig_norm).reshape(orig_shape)
+
+
+class MuonOptimizer(torch.optim.Optimizer):
+    """SGD con momento + ortogonalizzazione Newton-Schulz.
+
+    Per parametri 2D (matrici): ortogonalizza il momento prima di applicarlo.
+    Riduce la curvatura effettiva e accelera la convergenza.
+    """
+
+    def __init__(self, params, lr: float = 0.0003, momentum: float = 0.95):
+        defaults = dict(lr=lr, momentum=momentum)
+        super().__init__(params, defaults)
+
+    @torch.no_grad()
+    def step(self, closure=None):
+        loss = None
+        if closure is not None:
+            with torch.enable_grad():
+                loss = closure()
+
+        for group in self.param_groups:
+            for p in group['params']:
+                if p.grad is None:
+                    continue
+                g = p.grad
+                state = self.state[p]
+
+                # Inizializza momento
+                if 'momentum_buf' not in state:
+                    state['momentum_buf'] = torch.zeros_like(g)
+
+                buf = state['momentum_buf']
+                buf.mul_(group['momentum']).add_(g)
+
+                # Ortogonalizza solo se 2D
+                if buf.ndim >= 2:
+                    g_orth = ns_step(buf.clone())
+                else:
+                    g_orth = buf.clone()
+
+                p.data.add_(g_orth, alpha=-group['lr'])
+
+        return loss
+
+
 class INT2Trainer:
     """
     Trainer specializzato per INT2.
@@ -146,15 +231,34 @@ class INT2Trainer:
         print(f"INT2 layers: {len(self.int2_layers)}")
         print(f"Non-INT2 params: {sum(p.numel() for p in self.non_int2_params):,}")
 
-        # Optimizer SOLO per non-INT2 params
-        if self.non_int2_params:
+        # Separa parametri FP32: 2D (embedding, lm_head) → Muon; 1D (norms, biases) → AdamW
+        fp32_2d = [p for p in self.non_int2_params if p.ndim >= 2]
+        fp32_1d = [p for p in self.non_int2_params if p.ndim < 2]
+
+        adamw_lr = train_cfg["adamw_lr"]
+
+        # AdamW per parametri 1D (norms, biases)
+        if fp32_1d:
             self.optimizer = torch.optim.AdamW(
-                self.non_int2_params,
-                lr=train_cfg["adamw_lr"],
+                fp32_1d,
+                lr=adamw_lr,
                 weight_decay=train_cfg["weight_decay"]
             )
         else:
             self.optimizer = None
+
+        # Muon per parametri 2D (embedding, lm_head) con LR dimezzato
+        if fp32_2d:
+            self.muon_optimizer = MuonOptimizer(
+                fp32_2d,
+                lr=adamw_lr * 0.5,
+                momentum=0.95
+            )
+            self.muon_base_lr = adamw_lr * 0.5
+            print(f"Muon optimizer: {sum(p.numel() for p in fp32_2d):,} 2D params")
+        else:
+            self.muon_optimizer = None
+            self.muon_base_lr = 0.0
 
         # Mixed precision
         self.use_amp = train_cfg["mixed_precision"] in ["fp16", "bf16"]
@@ -193,6 +297,19 @@ class INT2Trainer:
             return base_lr * (self.global_step + 1) / self.warmup_steps
         return base_lr
 
+    def _update_prores_alpha(self, step: int):
+        """ProRes: aggiorna residual_alpha per ogni block.
+
+        Layer i riceve: alpha = min(1.0, step / (warmup * (1 + i/n_blocks)))
+        I layer profondi hanno warmup più lungo → alpha cresce più lentamente.
+        """
+        n_blocks = len(self.model.blocks)
+        warmup = self.warmup_steps
+        for i, block in enumerate(self.model.blocks):
+            warmup_i = warmup * (1.0 + i / max(1, n_blocks))
+            alpha = min(1.0, step / max(1, warmup_i))
+            block.set_residual_alpha(alpha)
+
     def compute_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
         """Calcola loss (con Liger se disponibile)."""
         # Shift per next-token prediction
@@ -221,6 +338,9 @@ class INT2Trainer:
         """Singolo step di training."""
         self.model.train()
 
+        # ProRes: aggiorna residual_alpha prima del forward pass
+        self._update_prores_alpha(self.global_step)
+
         input_ids = batch["input_ids"].to(self.device)
         labels = batch["labels"].to(self.device)
 
@@ -247,6 +367,17 @@ class INT2Trainer:
 
             # Loss
             loss = self.compute_loss(logits, labels)
+
+            # NaN/Inf guard: abort early to avoid silent training collapse.
+            # Saves an emergency checkpoint so the failed state can be inspected.
+            if not torch.isfinite(loss):
+                ckpt_dir = self.config["checkpointing"]["output_dir"]
+                emergency_path = os.path.join(ckpt_dir, f"NAN_step_{self.global_step}.pt")
+                print(f"FATAL: non-finite loss ({loss.item()}) at step {self.global_step}. "
+                      f"Saving emergency checkpoint to {emergency_path}")
+                self.save_checkpoint(emergency_path)
+                raise RuntimeError(f"Non-finite loss at step {self.global_step}")
+
             loss = loss / self.grad_accum_steps  # Scale per accumulation
 
         # Backward
@@ -266,24 +397,38 @@ class INT2Trainer:
             # Gradient clipping
             if self.config["training"]["max_grad_norm"] > 0:
                 if self.scaler is not None:
-                    self.scaler.unscale_(self.optimizer)
+                    # Unscale via whichever optimizer is available
+                    _unscale_opt = self.optimizer if self.optimizer is not None else self.muon_optimizer
+                    if _unscale_opt is not None:
+                        self.scaler.unscale_(_unscale_opt)
                 torch.nn.utils.clip_grad_norm_(
                     self.model.parameters(),
                     self.config["training"]["max_grad_norm"]
                 )
 
-            # Update non-INT2 params con AdamW
+            # Update parametri 1D con AdamW
             if self.optimizer is not None:
                 if self.scaler is not None:
                     self.scaler.step(self.optimizer)
-                    self.scaler.update()
                 else:
                     self.optimizer.step()
                 self.optimizer.zero_grad()
 
+            # Update parametri 2D con Muon (con warmup)
+            if self.muon_optimizer is not None:
+                current_muon_lr = self.get_lr(self.muon_base_lr)
+                for group in self.muon_optimizer.param_groups:
+                    group['lr'] = current_muon_lr
+                self.muon_optimizer.step()
+                self.muon_optimizer.zero_grad()
+
+            # Aggiorna scaler UNA VOLTA dopo tutti gli optimizer (solo fp16)
+            if self.scaler is not None:
+                self.scaler.update()
+
             # Hysteresis update per INT2 layers
             current_lr = self.get_lr(self.int2_lr)
-            self._hysteresis_update_all(current_lr)
+            self._hysteresis_update_all(current_lr, step=self.global_step)
 
             self.global_step += 1
             self.accum_count = 0
@@ -297,7 +442,25 @@ class INT2Trainer:
             "tokens": self.tokens_seen
         }
 
-    def _hysteresis_update_all(self, lr: float):
+    def _compute_hestia_threshold(self, step: int) -> int:
+        """HESTIA: anneal threshold ternario entro il range INT4 rappresentabile.
+
+        Alta soglia iniziale = aggiornamenti INT2 più rari = stabilità early training.
+        Risultato paper: +5.4% qualità su benchmark LM.
+        """
+        int4_max_threshold = 7
+        model_cfg = self.config["model"]
+        t_final = min(model_cfg["int2_threshold"], int4_max_threshold)
+        t_init = model_cfg.get("int2_threshold_init", t_final)  # fallback: nessun annealing
+        t_init = min(t_init, int4_max_threshold)
+        warmup = self.warmup_steps
+        if step >= warmup:
+            return t_final
+        frac = step / max(1, warmup)
+        threshold = int(round(t_init + frac * (t_final - t_init)))
+        return max(0, min(int4_max_threshold, threshold))
+
+    def _hysteresis_update_all(self, lr: float, step: int = 0):
         """
         Esegue hysteresis update su tutti i layer INT2.
 
@@ -306,6 +469,7 @@ class INT2Trainer:
         hysteresis_update(), so we must NOT increment it again here
         (that was causing the double-increment bug).
         """
+        threshold = self._compute_hestia_threshold(step)
         for layer in self.int2_layers:
             if hasattr(layer, 'int2_layer'):
                 int2 = layer.int2_layer
@@ -315,6 +479,10 @@ class INT2Trainer:
             # Imposta LR per il prossimo backward
             if hasattr(int2, 'set_lr'):
                 int2.set_lr(lr)
+
+            # HESTIA: aggiorna threshold corrente
+            if hasattr(int2, 'threshold'):
+                int2.threshold = threshold
 
             # Refresh gamma cache (1 sync per layer, once per optimizer step instead of every fwd/bwd)
             if hasattr(int2, '_gamma_cached'):
@@ -363,6 +531,29 @@ class INT2Trainer:
             "val_tokens": total_tokens
         }
 
+    def _rotate_checkpoints(self, output_dir: str, keep: int):
+        """Mantieni solo gli ultimi `keep` checkpoint step_*.pt; preserva best.pt e final.pt."""
+        if keep <= 0:
+            return
+        try:
+            entries = []
+            for name in os.listdir(output_dir):
+                if name.startswith("step_") and name.endswith(".pt"):
+                    try:
+                        step = int(name[len("step_"):-len(".pt")])
+                    except ValueError:
+                        continue
+                    entries.append((step, os.path.join(output_dir, name)))
+            entries.sort()
+            for _, path in entries[:-keep]:
+                try:
+                    os.remove(path)
+                    print(f"Rotated old checkpoint: {path}")
+                except OSError as e:
+                    print(f"Warning: failed to remove {path}: {e}")
+        except FileNotFoundError:
+            pass
+
     def save_checkpoint(self, path: str, extra_state: dict = None):
         """Salva checkpoint."""
         os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -393,6 +584,7 @@ class INT2Trainer:
             "model_state_dict": self.model.state_dict(),
             "int2_state": int2_state,
             "optimizer_state_dict": self.optimizer.state_dict() if self.optimizer else None,
+            "muon_optimizer_state_dict": self.muon_optimizer.state_dict() if self.muon_optimizer else None,
             "config": self.config,
         }
 
@@ -416,6 +608,8 @@ class INT2Trainer:
         # Carica optimizer
         if self.optimizer and checkpoint.get("optimizer_state_dict"):
             self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        if self.muon_optimizer and checkpoint.get("muon_optimizer_state_dict"):
+            self.muon_optimizer.load_state_dict(checkpoint["muon_optimizer_state_dict"])
 
         # Sync _step_py from buffer for all INT2 layers
         for layer in self.int2_layers:
@@ -464,7 +658,8 @@ def create_small_elleci_config(config: dict, dry_run: bool = False) -> ElleciCon
         use_moe = model_cfg.get("use_moe", False)
 
     # n_heads from config or auto-detect
-    n_heads_mla = model_cfg.get("n_heads", None)
+    # In dry-run mode d_model è ridotto (256), ignora n_heads dal config per evitare 256%12≠0
+    n_heads_mla = None if dry_run else model_cfg.get("n_heads", None)
     if n_heads_mla is None:
         if d_model >= 2048:
             n_heads_mla = 32
@@ -478,9 +673,6 @@ def create_small_elleci_config(config: dict, dry_run: bool = False) -> ElleciCon
                     n_heads_mla = n
                     break
 
-    # Mamba n_heads: from config or same as MLA
-    n_heads_mamba = mamba_cfg.get("n_heads", n_heads_mla)
-
     # Mamba settings from YAML (with defaults for backward compat)
     use_matmul_ssd = mamba_cfg.get("use_matmul_ssd", True)
     use_checkpointing = mamba_cfg.get("use_checkpointing", True)
@@ -488,6 +680,17 @@ def create_small_elleci_config(config: dict, dry_run: bool = False) -> ElleciCon
     chunk_size = mamba_cfg.get("chunk_size", 32)
     d_state = mamba_cfg.get("d_state", 16)
     expand = mamba_cfg.get("expand", 2)
+
+    # Mamba n_heads: from config or same as MLA
+    # In dry-run mode usa auto-detect: d_inner = d_model*expand deve essere divisibile per n_heads
+    if dry_run:
+        d_inner = d_model * expand
+        n_heads_mamba = n_heads_mla  # auto-detected sopra, compatibile con d_model
+        # Assicura che d_inner sia divisibile per n_heads_mamba
+        while n_heads_mamba > 1 and d_inner % n_heads_mamba != 0:
+            n_heads_mamba //= 2
+    else:
+        n_heads_mamba = mamba_cfg.get("n_heads", n_heads_mla)
 
     # Crea sub-configs
     mla_config = MLAConfig(
@@ -548,10 +751,18 @@ def main():
 
     if device == "cuda":
         print(f"GPU: {torch.cuda.get_device_name()}")
-        print(f"VRAM: {torch.cuda.get_device_properties(0).total_memory / 1e9:.1f} GB")
+        total_vram_gb = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"VRAM: {total_vram_gb:.1f} GB")
 
     # Config
     config = load_config(args.config)
+
+    # Guard rail: a100_7b config requires ~38GB headroom; abort early on wrong instance
+    if device == "cuda" and "a100_7b" in args.config and not args.dry_run:
+        assert total_vram_gb >= 38, (
+            f"a100_7b.yaml needs A100 40GB (or larger). Detected {total_vram_gb:.1f} GB. "
+            "Use configs/rtx4070_s.yaml for smaller GPUs."
+        )
 
     # Dry run override
     if args.dry_run:
@@ -602,6 +813,8 @@ def main():
     model_cfg = config["model"]
     enable_offload = config.get("training", {}).get("enable_offload", False)
     print(f"CPU offload: {'enabled' if enable_offload else 'disabled'}")
+    use_24_sparsity = model_cfg.get("use_24_sparsity", False)
+    use_hadamard_int4 = model_cfg.get("use_hadamard_int4", False)
     model = convert_all_linear_to_int2(
         model,
         threshold=model_cfg["int2_threshold"],
@@ -610,13 +823,25 @@ def main():
         min_size=256,
         inplace=True,
         verbose=True,
-        enable_offload=enable_offload
+        enable_offload=enable_offload,
+        use_24_sparsity=use_24_sparsity,
+        use_hadamard_int4=use_hadamard_int4
     ).to(device)
+    if use_24_sparsity:
+        print("Sparse-BitNet: 2:4 sparsity enabled")
+    if use_hadamard_int4:
+        print("BitNet v2: Hadamard+INT4 activations enabled (50% less activation memory)")
 
     # Gradient checkpointing (per-layer): trades compute for VRAM
     if config["optimizations"].get("gradient_checkpointing", False):
         model.gradient_checkpointing_enable()
         print("Gradient checkpointing: enabled (per-layer)")
+
+    # torch.compile: fuse ops into optimized kernels (first step slow due to compilation)
+    if config["optimizations"].get("compile_model", False):
+        print("torch.compile: compiling model (first step will be slow)...")
+        model = torch.compile(model, mode="default")
+        print("torch.compile: done")
 
     # Stats modello
     total_params = sum(p.numel() for p in model.parameters())
@@ -845,6 +1070,10 @@ def main():
         if trainer.global_step > 0 and trainer.global_step % log_cfg["save_interval"] == 0 and trainer.accum_count == 0:
             trainer.save_checkpoint(
                 os.path.join(ckpt_cfg["output_dir"], f"step_{trainer.global_step}.pt")
+            )
+            trainer._rotate_checkpoints(
+                ckpt_cfg["output_dir"],
+                keep=ckpt_cfg.get("save_total_limit", 3)
             )
 
     # Final save

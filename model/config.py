@@ -25,8 +25,9 @@ class MLAConfig:
     n_heads: int = 12
     kv_lora_rank: int = 128  # Compression rank for KV cache
     rope_base: int = 100000  # RoPE base (100000 = 128k context support)
+    max_seq_len: int = 8192  # Sized RoPE cache; sync from ElleciConfig.__post_init__
     dropout: float = 0.0
-    
+
     def __post_init__(self):
         assert self.d_model % self.n_heads == 0, "d_model must be divisible by n_heads"
         self.head_dim = self.d_model // self.n_heads
@@ -46,7 +47,12 @@ class MambaConfig:
     use_mamba2: bool = True  # Use Mamba-2 instead of Mamba v1
     use_matmul_ssd: bool = True # Use Matmul-based SSD (Scan-free)
     use_checkpointing: bool = False # VRAM optimization (Gradient Checkpointing)
-    use_cuda_ssd: bool = True   # Use Custom CUDA Kernel (Max VRAM Savings)
+    # M1 risolto: il backward (tensor-ops) calcola dx/ddt/dA/dB/dC corretti (gradcheck fp64).
+    # ⚠️ M3: il FORWARD kernel CUDA calcola solo il contributo intra-chunk (nessuno stato
+    # inter-chunk) e usa dt per-head (dt[...,0]). NON è corretto per seqlen > chunk_size né
+    # per dt per-canale (dt_proj→d_inner). Tienilo False: con seqlen > chunk_size mamba2_cuda
+    # solleva NotImplementedError. Per il training reale usa use_matmul_ssd.
+    use_cuda_ssd: bool = False  # Custom CUDA Kernel (forward fuso) — SOLO intra-chunk (M3)
 
     
     def __post_init__(self):
@@ -200,6 +206,9 @@ class ElleciConfig:
         self.mamba.d_model = self.d_model
         self.router.d_model = self.d_model
         self.moe.d_model = self.d_model
+
+        # Sync max_seq_len so MLA's RoPE cache matches the model context window
+        self.mla.max_seq_len = self.max_seq_len
 
         # Auto-set n_heads based on d_model (head_dim should be 64-128)
         # d_model=768 -> 12 heads (head_dim=64)

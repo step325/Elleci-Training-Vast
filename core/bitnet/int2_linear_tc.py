@@ -30,11 +30,13 @@ _CUDA_ARCH = _get_cuda_arch_flag()
 
 try:
     int2_tc_ops = load(
-        name=f"int2_tc_ops_consolidated_v4_{_CUDA_ARCH.replace('-arch=', '')}",
+        name=f"int2_tc_ops_consolidated_v5_{_CUDA_ARCH.replace('-arch=', '')}",
         sources=[
             os.path.join(KERNELS_DIR, "int2_tc_ops.cpp"),
             os.path.join(KERNELS_DIR, "int2_matmul_tc.cu"),
+            os.path.join(KERNELS_DIR, "int2_matmul_int8_tc_v2.cu"),
             os.path.join(KERNELS_DIR, "int2_backward_tc.cu"),
+            os.path.join(KERNELS_DIR, "int2_backward_int8_tc_v2.cu"),
             os.path.join(KERNELS_DIR, "int2_hysteresis_tc.cu"),
             os.path.join(KERNELS_DIR, "int2_hysteresis_v2.cu"),
             os.path.join(KERNELS_DIR, "int2_activation_quant.cu"),
@@ -53,32 +55,233 @@ except Exception as e:
     HAS_INT2_OPS = False
 
 
+def apply_24_sparsity(W_ternary: torch.Tensor) -> torch.Tensor:
+    """Forza sparsità 2:4 su pesi ternari {-1,0,+1}.
+
+    In ogni gruppo di 4 elementi, mantieni esattamente i 2 con valore assoluto
+    più alto; azzera gli altri. Con pesi ternari il risultato è sempre in {-1,0,+1}.
+
+    Args:
+        W_ternary: tensor float o INT8 ternario [N, K], valori in {-1, 0, 1}
+
+    Returns:
+        Tensor con sparsità 2:4, stessi shape e dtype.
+    """
+    original_dtype = W_ternary.dtype
+    N, K = W_ternary.shape
+
+    # Pad K a multiplo di 4 se necessario
+    pad = (4 - K % 4) % 4
+    if pad > 0:
+        W_padded = torch.nn.functional.pad(W_ternary.float(), (0, pad))
+    else:
+        W_padded = W_ternary.float()
+
+    K_padded = W_padded.shape[1]
+    W_grouped = W_padded.view(N, K_padded // 4, 4)  # [N, groups, 4]
+
+    # Top-2 per gruppo (per valore assoluto)
+    abs_vals = W_grouped.abs()
+    _, top2_idx = abs_vals.topk(2, dim=2)
+
+    mask = torch.zeros_like(W_grouped)
+    mask.scatter_(2, top2_idx, 1.0)
+
+    W_sparse = (W_grouped * mask).view(N, K_padded)
+
+    # Rimuovi padding
+    if pad > 0:
+        W_sparse = W_sparse[:, :K]
+
+    return W_sparse.to(dtype=original_dtype)
+
+
+# ===========================================================================
+# BitNet v2: Walsh-Hadamard Transform + INT4 Quantization
+# ===========================================================================
+
+def _hadamard_transform(x: torch.Tensor) -> torch.Tensor:
+    """Walsh-Hadamard Transform sull'ultima dimensione.
+
+    x.shape[-1] deve essere potenza di 2.
+    Normalizza per 1/sqrt(K) → trasformazione ortonormale.
+    """
+    K = x.shape[-1]
+    assert K > 0 and (K & (K - 1)) == 0, f"Last dim must be power of 2, got {K}"
+
+    result = x.clone()
+    step = 1
+    while step < K:
+        # Butterfly: pair each element with its partner at distance `step`
+        n_groups = K // (2 * step)
+        r = result.view(*result.shape[:-1], n_groups, 2, step)
+        a = r[..., 0, :].clone()  # clone to avoid in-place issues
+        b = r[..., 1, :].clone()
+        r_new = torch.stack([a + b, a - b], dim=-2)
+        result = r_new.view(*result.shape)
+        step <<= 1
+
+    return result / (K ** 0.5)
+
+
+def quantize_hadamard_int4(x: torch.Tensor):
+    """Hadamard + INT4 quantization per le attivazioni.
+
+    Applica WHT per distribuire gli outlier, poi quantizza a INT4 [-7,7].
+    Risparmio memoria: -50% rispetto a INT8.
+
+    Args:
+        x: Tensor [*, K] (float16 o bfloat16), K deve essere potenza di 2
+
+    Returns:
+        packed: Tensor [*, K//2] uint8 (2 INT4 per byte)
+        scale: Tensor [*] float32 (scala per riga)
+    """
+    orig_shape = x.shape
+    K = x.shape[-1]
+
+    # Pad K a prossima potenza di 2 se necessario
+    K_padded = 1 << (K - 1).bit_length() if K > 1 else 1
+
+    # Lavora in float32 per precisione
+    x_flat = x.reshape(-1, K).float()
+    M = x_flat.shape[0]
+
+    if K_padded != K:
+        x_flat = torch.nn.functional.pad(x_flat, (0, K_padded - K))
+
+    # Hadamard transform (ortonormale)
+    x_h = _hadamard_transform(x_flat)  # [M, K_padded]
+
+    if K_padded != K:
+        x_h = x_h[:, :K]
+
+    # Per-row scale: absmax / 7
+    absmax = x_h.abs().amax(dim=-1, keepdim=True).clamp(min=1e-8)  # [M, 1]
+    scale = absmax / 7.0
+
+    # Quantize a INT4 [-7, 7]
+    x_q = (x_h / scale).round().clamp(-7, 7).to(torch.int8)  # [M, K]
+
+    # Shift a [0, 14] per nibble encoding senza segno
+    x_shifted = x_q + 7  # [0, 14], ancora int8
+
+    # Pad K a multiplo di 2
+    if K % 2 != 0:
+        x_shifted = torch.nn.functional.pad(x_shifted, (0, 1))
+
+    # Pack: byte0 = low_nibble | (high_nibble << 4)
+    even = x_shifted[:, 0::2].to(torch.uint8)  # [M, K//2]
+    odd  = x_shifted[:, 1::2].to(torch.uint8)  # [M, K//2]
+    packed = (even & 0x0F) | ((odd & 0x0F) << 4)  # [M, K//2]
+
+    # Reshape
+    out_k = packed.shape[-1]
+    out_shape_packed = list(orig_shape[:-1]) + [out_k]
+    out_shape_scale  = list(orig_shape[:-1])
+
+    return packed.view(out_shape_packed), scale.squeeze(-1).view(out_shape_scale)
+
+
+def dequantize_hadamard_int4(packed: torch.Tensor, scale: torch.Tensor, K: int) -> torch.Tensor:
+    """Inverso: unpack INT4 + WHT inverso.
+
+    Args:
+        packed: [*, K//2] uint8
+        scale:  [*] float32
+        K:      dimensione originale delle attivazioni
+
+    Returns:
+        [*, K] float16
+    """
+    orig_shape_scale = scale.shape
+    M = packed.numel() // packed.shape[-1]
+    K_half = packed.shape[-1]
+
+    packed_flat = packed.reshape(M, K_half)
+    scale_flat  = scale.reshape(M, 1).float()
+
+    # Unpack nibbles
+    low  = (packed_flat & 0x0F).to(torch.int8)           # [M, K_half]
+    high = ((packed_flat >> 4) & 0x0F).to(torch.int8)    # [M, K_half]
+
+    # Shift da [0,14] a [-7,7]
+    low  = low  - 7
+    high = high - 7
+
+    # Interleave: [even, odd] → [M, 2*K_half]
+    x_int4 = torch.empty(M, 2 * K_half, dtype=torch.int8, device=packed.device)
+    x_int4[:, 0::2] = low
+    x_int4[:, 1::2] = high
+
+    # Tronca a K se c'era padding
+    if 2 * K_half > K:
+        x_int4 = x_int4[:, :K]
+
+    # Dequantize
+    x_float = x_int4.float() * scale_flat  # [M, K]
+
+    # Inverse Hadamard: applica WHT di nuovo (H @ H = K*I, normalizzato 1/sqrt(K))
+    K_padded = 1 << (K - 1).bit_length() if K > 1 else 1
+    if K_padded != K:
+        x_float = torch.nn.functional.pad(x_float, (0, K_padded - K))
+
+    x_rec = _hadamard_transform(x_float)
+
+    if K_padded != K:
+        x_rec = x_rec[:, :K]
+
+    # Reshape a forma originale
+    out_shape = list(orig_shape_scale) + [K]
+    return x_rec.half().view(out_shape)
+
+
 class Int2LinearTCFunction(Function):
-    """Custom autograd function using TC-optimized kernels."""
+    """Custom autograd function using TC-optimized kernels (INT8 IMMA path)."""
+
+    # Shared absmax buffer for async quantization — avoids cudaStreamSynchronize.
+    # Dict keyed by device to support single-process multi-GPU if needed.
+    _absmax_bufs: dict = {}
+
+    @staticmethod
+    def _get_absmax_buf(device: torch.device) -> torch.Tensor:
+        key = str(device)
+        if key not in Int2LinearTCFunction._absmax_bufs:
+            Int2LinearTCFunction._absmax_bufs[key] = torch.zeros(
+                1, dtype=torch.float32, device=device
+            )
+        return Int2LinearTCFunction._absmax_bufs[key]
 
     @staticmethod
     def forward(ctx, X: torch.Tensor, W_packed: torch.Tensor, gamma: torch.Tensor,
                 K: int, gamma_cached: float = None) -> torch.Tensor:
         """
-        Forward pass: Y = X @ W.T * gamma (using Tensor Cores)
+        Forward pass: Y = X_int8 @ W_int8.T * (scale_x/127) * gamma
+        Uses INT8 IMMA Tensor Cores (2x throughput vs FP16 WMMA).
         """
         ctx.save_for_backward(W_packed, gamma)
         ctx.K = K
         ctx.gamma_cached = gamma_cached
 
         X_half = X.half() if X.dtype != torch.float16 else X
-        # Use cached gamma (Python float) to avoid GPU→CPU sync
         gamma_val = gamma_cached if gamma_cached is not None else gamma.item()
 
-        # Use TC-optimized matmul
-        Y = int2_tc_ops.matmul(X_half.contiguous(), W_packed, gamma_val)
+        # Quantize X to INT8 asynchronously (no GPU→CPU sync)
+        d_absmax = Int2LinearTCFunction._get_absmax_buf(X.device)
+        X_int8, d_scale_x = int2_tc_ops.quantize_activation_async(
+            X_half.contiguous(), d_absmax
+        )
+
+        # INT8 matmul: Y = X_int8 @ W_int8.T * (scale_x/127) * gamma
+        Y = int2_tc_ops.matmul_int8(X_int8, W_packed, d_scale_x, gamma_val)
 
         return Y
 
     @staticmethod
     def backward(ctx, dY: torch.Tensor) -> Tuple[Optional[torch.Tensor], ...]:
         """
-        Backward pass: compute dX = dY @ W (using Tensor Cores)
+        Backward pass: dX = dY_int8 @ W_int8 * (scale_dy/127) * gamma
+        Uses INT8 IMMA Tensor Cores.
         """
         W_packed, gamma = ctx.saved_tensors
         K = ctx.K
@@ -86,11 +289,18 @@ class Int2LinearTCFunction(Function):
         dX = None
         if ctx.needs_input_grad[0]:
             dY_half = dY.half() if dY.dtype != torch.float16 else dY
-            # Use cached gamma to avoid GPU→CPU sync
             gamma_val = ctx.gamma_cached if ctx.gamma_cached is not None else gamma.item()
 
-            # Use TC-optimized backward
-            dX = int2_tc_ops.backward_input(dY_half.contiguous(), W_packed, gamma_val, K)
+            # Quantize dY to INT8 asynchronously
+            d_absmax = Int2LinearTCFunction._get_absmax_buf(dY.device)
+            dY_int8, d_scale_dy = int2_tc_ops.quantize_activation_async(
+                dY_half.contiguous(), d_absmax
+            )
+
+            # INT8 backward: dX = dY_int8 @ W_int8 * (scale_dy/127) * gamma
+            dX = int2_tc_ops.backward_input_int8(
+                dY_int8, W_packed, d_scale_dy, gamma_val, K
+            )
 
         return dX, None, None, None, None
 
@@ -126,7 +336,9 @@ class Int2LinearTC(nn.Module):
         threshold: int = 7,
         lr_scale: float = 5.0,
         decay_rate: float = 0.001,
-        compress_activations: bool = True  # Phase 2: Enable INT8 compression
+        compress_activations: bool = True,  # Phase 2: Enable INT8 compression
+        use_24_sparsity: bool = False,  # Sparse-BitNet: 2:4 structured sparsity
+        use_hadamard_int4: bool = False    # BitNet v2: Hadamard+INT4 (vs INT8)
     ):
         super().__init__()
 
@@ -139,6 +351,13 @@ class Int2LinearTC(nn.Module):
         self.lr_scale = lr_scale
         self.decay_rate = decay_rate
         self.compress_activations = compress_activations
+        self.use_24_sparsity = use_24_sparsity
+        self.use_hadamard_int4 = use_hadamard_int4
+        # Pre-alloca K_padded per Hadamard (potenza di 2 >= in_features)
+        if use_hadamard_int4:
+            k = in_features
+            k_pad = 1 << (k - 1).bit_length() if k > 1 else 1
+            self.register_buffer('_had_K_padded', torch.tensor(k_pad, dtype=torch.int64))
 
         # Packed weights: INT2, 4 weights per byte
         packed_K = (in_features + 3) // 4
@@ -179,6 +398,10 @@ class Int2LinearTC(nn.Module):
 
         w_scaled = weight / scale
         w_ternary = w_scaled.round().clamp(-1, 1).to(torch.int8)
+
+        # Sparse-BitNet: applica sparsità 2:4 prima del packing
+        if self.use_24_sparsity:
+            w_ternary = apply_24_sparsity(w_ternary)
 
         # Always use CPU packing (fast enough for initialization)
         self._pack_int2_cpu(w_ternary)
@@ -222,13 +445,17 @@ class Int2LinearTC(nn.Module):
             self.init_from_float(w_init)
 
         if self.training:
-            # Phase 2: Optionally compress saved activations to INT8
             x_detached = x.detach()
-            if self.compress_activations:
-                # Convert to half for quantization kernel
+            if self.use_hadamard_int4:
+                # BitNet v2: Hadamard + INT4 compression (50% less memory than INT8)
                 x_half = x_detached.half() if x_detached.dtype != torch.float16 else x_detached
                 self._saved_input_shape = x_half.shape
-                # Async quantize: zero GPU→CPU sync
+                packed, scale = quantize_hadamard_int4(x_half.contiguous())
+                self._saved_input = (packed, scale, 'int4_hadamard')
+            elif self.compress_activations:
+                # Phase 2: INT8 compression
+                x_half = x_detached.half() if x_detached.dtype != torch.float16 else x_detached
+                self._saved_input_shape = x_half.shape
                 if Int2LinearTC._shared_absmax_buf is None or Int2LinearTC._shared_absmax_buf.device != x.device:
                     Int2LinearTC._shared_absmax_buf = torch.zeros(1, dtype=torch.float32, device=x.device)
                 self._saved_input = int2_tc_ops.quantize_activation_async(
@@ -279,11 +506,17 @@ class Int2LinearTC(nn.Module):
 
         self._step_py += 1
 
-        # Phase 2: Decompress saved input if it was compressed
-        if self.compress_activations and isinstance(self._saved_input, tuple):
+        # Decomprimi attivazione salvata
+        if isinstance(self._saved_input, tuple) and len(self._saved_input) == 3 and self._saved_input[2] == 'int4_hadamard':
+            # BitNet v2: Hadamard INT4 decompressione
+            packed, scale, _ = self._saved_input
+            K = self._saved_input_shape[-1] if self._saved_input_shape is not None else self.in_features
+            X = dequantize_hadamard_int4(packed, scale, K)
+            if self._saved_input_shape is not None:
+                X = X.view(self._saved_input_shape)
+        elif self.compress_activations and isinstance(self._saved_input, tuple):
             x_int8, scale = self._saved_input
             X = int2_tc_ops.dequantize_activation(x_int8, scale)
-            # Restore original shape
             if self._saved_input_shape is not None:
                 X = X.view(self._saved_input_shape)
         else:
@@ -323,9 +556,21 @@ class Int2LinearTC(nn.Module):
                 self._step_py
             )
 
+        # Sparse-BitNet: applica sparsità 2:4 dopo hysteresis update
+        if self.use_24_sparsity:
+            # Decomprimi W_packed → FP16 usando il kernel unpack_int2
+            W_fp16 = torch.empty(self.out_features, self.in_features,
+                                 dtype=torch.float16, device=self.W_packed.device)
+            int2_tc_ops.unpack_int2(self.W_packed, W_fp16, self.in_features)
+            # Applica maschera 2:4 (lavora su float, risultato in {-1,0,+1})
+            W_sparse_fp16 = apply_24_sparsity(W_fp16)
+            # Riconverti a INT8 e repack
+            W_sparse_int8 = W_sparse_fp16.round().clamp(-1, 1).to(torch.int8).cpu()
+            self._pack_int2_cpu(W_sparse_int8)
+
         self._saved_input = None
         self._saved_input_shape = None
-    
+
     # ==========================================================================
     # LEGACY METHOD (kept for reference - DO NOT USE)
     # ==========================================================================
@@ -411,8 +656,8 @@ class Int2LinearTCWithGradHook(Int2LinearTC):
     Inherits INT8 activation compression from Int2LinearTC (Phase 2).
     """
 
-    def __init__(self, *args, compress_activations: bool = True, **kwargs):
-        super().__init__(*args, compress_activations=compress_activations, **kwargs)
+    def __init__(self, *args, compress_activations: bool = True, use_24_sparsity: bool = False, use_hadamard_int4: bool = False, **kwargs):
+        super().__init__(*args, compress_activations=compress_activations, use_24_sparsity=use_24_sparsity, use_hadamard_int4=use_hadamard_int4, **kwargs)
         self._lr = 0.001
 
     def set_lr(self, lr: float):

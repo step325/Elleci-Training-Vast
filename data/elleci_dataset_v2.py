@@ -1,37 +1,54 @@
 """
-Elleci v2 Dataset - 3-Phase Training with Enhanced Data Strategy
+Elleci v2 Dataset - EN-only pretraining (top-tier mix, max intelligence density)
 
-Phase 1: English Foundation (60% of training - 35K steps)
-    - FineWeb-Edu: 45% (highest quality educational web content)
-    - Cosmopedia V2: 25% (synthetic educational)
-    - OpenWebMath: 15% (mathematics)
-    - The Stack v2: 15% (code)
+Strategia: pretraining 100% EN con SOLO i dataset top di ogni categoria.
+Italiano via fine-tuning separato post-training (Llamantino-style).
 
-Phase 2: Italian Knowledge (25% of training - 15K steps)
-    - CulturaX Italian: 70% (200GB+ cleaned Italian)
-    - Wikipedia IT: 15% (encyclopedia)
-    - English maintenance: 15% (prevent forgetting)
+Phase 1: EN Foundation web (60% del budget totale)
+    - FineWeb-Edu: 45% (1.3T, edu-filtered, top intelligence/token)
+    - DCLM-Baseline: 25% (4T, top diversity baseline)
+    - Nemotron-CC v2: 20% (NVIDIA HQ subset, +5.6 MMLU vs DCLM)
+    - Cosmopedia V2: 10% (synthetic textbook, knowledge density)
 
-Phase 3: Instruction Alignment (15% of training - 10K steps)
-    - OpenOrca: 30% (EN reasoning/math)
-    - Fauno IT: 25% (IT Q&A)
-    - Alpaca IT: 20% (IT instructions)
-    - Local instructions: 10% (IT creative)
-    - Dolly: 10% (EN diverse)
-    - CodeAlpaca: 5% (code)
+Phase 2: Reasoning heavy - math + code (25%)
+    - The Stack v2 smol-ids: 30% (code repo-level, 17 lang core)
+    - Nemotron-CC-Math 4+: 25% (NVIDIA 52B math HQ, Lynx+LLM pipeline)
+    - FineMath-4+: 20% (HF math reasoning HQ 9.6B)
+    - Proof-Pile-2: 15% (formal math + arxiv + algebraic stack 55B)
+    - MathCode-Pile: 10% (math+code intersezione reasoning steps 19B)
 
-Data Sources:
-- FineWeb-Edu: HuggingFaceFW/fineweb-edu
-- Cosmopedia V2: HuggingFaceTB/smollm-corpus (cosmopedia-v2)
-- OpenWebMath: open-web-math/open-web-math
-- The Stack v2: bigcode/the-stack-v2-train-smol-ids
-- CulturaX Italian: uonlp/CulturaX (it)
-- Wikipedia IT: wikimedia/wikipedia (20231101.it)
-- OpenOrca: Open-Orca/OpenOrca
-- Alpaca IT: teelinsan/camoscio
-- Fauno IT: andreabac3/StackOverflow-Italian-Fauno-Baize + andreabac3/Quora-Italian-Fauno-Baize
-- Dolly: databricks/databricks-dolly-15k
-- CodeAlpaca: sahil2801/CodeAlpaca-20k
+Phase 3: Reasoning + Instruction (15%)
+    - OpenR1-Math-220k: 25% (220K DeepSeek-R1 CoT verificati, top math reasoning)
+    - OpenMathReasoning: 25% (NVIDIA 306K AoPS, R1/QwQ solutions, no gate)
+    - Natural Reasoning: 20% (Meta 1.15M general reasoning, CC-BY-NC)
+    - Tulu 3 SFT mix: 20% (Allen AI, top EN instruction 2025)
+    - Nemotron-Pretraining-SFT v1: 10% (NVIDIA STEM/code/math SFT)
+
+Data Sources (HF datasets):
+- FineWeb-Edu: HuggingFaceFW/fineweb-edu (ODC-BY, no gate)
+- DCLM-Baseline: mlfoundations/dclm-baseline-1.0 (CC-BY-4.0, no gate)
+- Nemotron-CC v2: nvidia/Nemotron-CC-v2 (NVIDIA agreement, GATED)
+- Cosmopedia V2: HuggingFaceTB/smollm-corpus, config cosmopedia-v2 (ODC-BY)
+- The Stack v2: bigcode/the-stack-v2-train-smol-ids (TOS accept, GATED)
+- Nemotron-CC-Math: nvidia/Nemotron-CC-Math-v1 "4plus" (GATED)
+- FineMath: HuggingFaceTB/finemath "finemath-4plus" (ODC-By, no gate)
+- Proof-Pile-2: EleutherAI/proof-pile-2 (mix licenses, no gate)
+- MathCode-Pile: MathGenie/MathCode-Pile (Apache 2.0, no gate)
+- OpenR1-Math-220k: open-r1/OpenR1-Math-220k "default" (Apache 2.0, no gate)
+- OpenMathReasoning: nvidia/OpenMathReasoning (CC-BY-4.0, no gate!)
+- Natural Reasoning: facebook/natural_reasoning (CC-BY-NC-4.0, no gate)
+- Tulu 3: allenai/tulu-3-sft-mixture (ODC-BY-1.0, no gate)
+- Nemotron-Pretraining-SFT: nvidia/Nemotron-Pretraining-SFT-v1 (GATED)
+
+GATED DATASETS — RICHIEDONO ACCEPT TOS SU HF WEB PRIMA DI USARE:
+  1. nvidia/Nemotron-CC-v2          → https://huggingface.co/datasets/nvidia/Nemotron-CC-v2
+  2. nvidia/Nemotron-CC-Math-v1     → https://huggingface.co/datasets/nvidia/Nemotron-CC-Math-v1
+  3. nvidia/Nemotron-Pretraining-SFT-v1 → https://huggingface.co/datasets/nvidia/Nemotron-Pretraining-SFT-v1
+  4. bigcode/the-stack-v2-train-smol-ids → https://huggingface.co/datasets/bigcode/the-stack-v2-train-smol-ids
+
+NOTA: I loader IT/legacy (CulturaX, Wikipedia IT, Fauno, Alpaca-IT, Dolly, OpenOrca,
+OpenHermes, MetaMath, Magpie, CodeAlpaca, OpenWebMath, StarCoder PR) restano nel file
+per riuso in fase POST-training (continued pretraining IT + SFT IT).
 """
 import torch
 from torch.utils.data import IterableDataset
@@ -87,34 +104,34 @@ class EllediDatasetV2(IterableDataset):
         self._init_streams()
 
     def _setup_ratios(self):
-        """Set up data mixing ratios based on training phase."""
+        """Set up data mixing ratios based on training phase (top-tier EN mix)."""
         if self.phase == 1:
-            # Phase 1: English Foundation
-            # Note: LIMA removed (deprecated script), 5% redistributed to FineWeb-Edu
+            # Phase 1: EN Foundation web — solo top-tier
             self.ratios = {
                 'fineweb_edu': 0.45,
-                'cosmopedia': 0.25,
-                'openwebmath': 0.15,
-                'stack': 0.15,
+                'dclm_baseline': 0.25,
+                'nemotron_cc_v2': 0.20,
+                'cosmopedia': 0.10,
             }
             self.sources = list(self.ratios.keys())
         elif self.phase == 2:
-            # Phase 2: Italian Knowledge
+            # Phase 2: Math + code — solo top-tier
             self.ratios = {
-                'culturax_it': 0.70,
-                'wikipedia_it': 0.15,
-                'english_mix': 0.15,  # Maintenance: FineWeb + Cosmopedia
+                'stack_v2_smol': 0.30,
+                'nemotron_cc_math': 0.25,
+                'finemath_4plus': 0.20,
+                'proof_pile_2': 0.15,
+                'mathcode_pile': 0.10,
             }
             self.sources = list(self.ratios.keys())
         elif self.phase == 3:
-            # Phase 3: Instruction Alignment
+            # Phase 3: Reasoning + instruction — solo top-tier
             self.ratios = {
-                'openorca': 0.30,
-                'fauno_it': 0.25,
-                'alpaca_it': 0.20,
-                'local_it': 0.10,
-                'dolly': 0.10,
-                'codealpaca': 0.05,
+                'openr1_math': 0.25,        # DeepSeek-R1 CoT verificati 220K
+                'openmath_reasoning': 0.25, # NVIDIA AoPS 306K, no gate
+                'natural_reasoning': 0.20,  # Meta 1.15M general reasoning
+                'tulu3': 0.20,              # Allen AI top instruction
+                'nemotron_sft_v1': 0.10,    # NVIDIA STEM/code/math SFT
             }
             self.sources = list(self.ratios.keys())
         else:
@@ -245,10 +262,7 @@ class EllediDatasetV2(IterableDataset):
         try:
             ds = load_dataset(
                 "wikimedia/wikipedia",
-                "20231101.it", # 20231101 often fails, try recent if needed, but keeping stable for now or updating
-                # Updating to a more likely available date or keeping logic to fallback
-                # Actually, user asked to update it. Let's try 20231101 -> 20241101.it 
-                "20231101.it", 
+                "20231101.it",
                 split="train",
                 streaming=True,
                 token=self.hf_token
@@ -356,41 +370,299 @@ class EllediDatasetV2(IterableDataset):
             print(f"  CodeAlpaca failed: {e}")
             return iter([])
 
+    # ========== EN-only Pretraining Streams (Phase 1/2/3 mix) ==========
+
+    def _get_dclm_baseline_stream(self) -> Iterator:
+        """DCLM-Baseline: 3.8T fastText-filtered Common Crawl."""
+        print("Loading DCLM-Baseline stream...")
+        try:
+            ds = load_dataset(
+                "mlfoundations/dclm-baseline-1.0",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=1000))
+        except Exception as e:
+            print(f"  DCLM-Baseline failed: {e}, falling back to FineWeb-Edu")
+            return self._get_fineweb_edu_stream()
+
+    def _get_nemotron_cc_v2_stream(self) -> Iterator:
+        """Nemotron-CC v2: NVIDIA HQ Common Crawl subset."""
+        print("Loading Nemotron-CC v2 stream...")
+        try:
+            ds = load_dataset(
+                "nvidia/Nemotron-CC-v2",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=1000))
+        except Exception as e:
+            print(f"  Nemotron-CC v2 failed: {e}, falling back to FineWeb-Edu")
+            return self._get_fineweb_edu_stream()
+
+    def _get_nemotron_cc_math_stream(self) -> Iterator:
+        """Nemotron-CC-Math 4+: NVIDIA HQ math subset (133B token)."""
+        print("Loading Nemotron-CC-Math 4+ stream...")
+        try:
+            ds = load_dataset(
+                "nvidia/Nemotron-CC-Math-v1",
+                "4plus",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  Nemotron-CC-Math failed: {e}, falling back to OpenWebMath")
+            return self._get_openwebmath_stream()
+
+    def _get_finemath_4plus_stream(self) -> Iterator:
+        """FineMath 4+: HF math reasoning HQ (9.6B token, 6.7M docs)."""
+        print("Loading FineMath 4+ stream...")
+        try:
+            ds = load_dataset(
+                "HuggingFaceTB/finemath",
+                "finemath-4plus",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  FineMath 4+ failed: {e}, falling back to OpenWebMath")
+            return self._get_openwebmath_stream()
+
+    def _get_proof_pile_2_stream(self) -> Iterator:
+        """Proof-Pile-2: formal math + arxiv math + algebraic stack."""
+        print("Loading Proof-Pile-2 stream...")
+        try:
+            ds = load_dataset(
+                "EleutherAI/proof-pile-2",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  Proof-Pile-2 failed: {e}, falling back to OpenWebMath")
+            return self._get_openwebmath_stream()
+
+    def _get_mathcode_pile_stream(self) -> Iterator:
+        """MathCode-Pile: math+code intersezione con reasoning steps (19.2B)."""
+        print("Loading MathCode-Pile stream...")
+        try:
+            ds = load_dataset(
+                "MathGenie/MathCode-Pile",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  MathCode-Pile failed: {e}, falling back to OpenWebMath")
+            return self._get_openwebmath_stream()
+
+    def _get_stack_v2_smol_stream(self) -> Iterator:
+        """The Stack v2 smol-ids: code repo-level (17 lang core, StarCoder2 train)."""
+        print("Loading The Stack v2 smol-ids stream...")
+        try:
+            ds = load_dataset(
+                "bigcode/the-stack-v2-train-smol-ids",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  Stack v2 smol failed: {e}, falling back to starcoderdata")
+            return self._get_stack_stream()
+
+    def _get_starcoder_pr_stream(self) -> Iterator:
+        """StarCoder PRs: GitHub PR + Jupyter + Kaggle for code diversity."""
+        print("Loading StarCoder GitHub PRs stream...")
+        try:
+            ds = load_dataset(
+                "bigcode/starcoder2data-extras",
+                "github-issues",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  StarCoder PRs failed: {e}, falling back to starcoderdata")
+            return self._get_stack_stream()
+
+    def _get_tulu3_stream(self) -> Iterator:
+        """Tulu 3 SFT mixture: best EN instruction 2025 (Allen AI)."""
+        print("Loading Tulu 3 SFT mixture stream...")
+        try:
+            ds = load_dataset(
+                "allenai/tulu-3-sft-mixture",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  Tulu 3 failed: {e}, falling back to OpenHermes")
+            return self._get_openhermes_stream()
+
+    def _get_openhermes_stream(self) -> Iterator:
+        """OpenHermes 2.5: diverse general instruction (~1M conv)."""
+        print("Loading OpenHermes 2.5 stream...")
+        try:
+            ds = load_dataset(
+                "teknium/OpenHermes-2.5",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  OpenHermes 2.5 failed: {e}")
+            return iter([])
+
+    def _get_metamath_stream(self) -> Iterator:
+        """MetaMathQA: math instruction (GSM8K-style augmentation)."""
+        print("Loading MetaMathQA stream...")
+        try:
+            ds = load_dataset(
+                "meta-math/MetaMathQA",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  MetaMathQA failed: {e}")
+            return iter([])
+
+    def _get_magpie_stream(self) -> Iterator:
+        """Magpie Pro: synthetic alignment data (300K multi-turn)."""
+        print("Loading Magpie Pro MT 300K stream...")
+        try:
+            ds = load_dataset(
+                "Magpie-Align/Magpie-Pro-MT-300K-v0.1",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  Magpie failed: {e}")
+            return iter([])
+
+    def _get_openr1_math_stream(self) -> Iterator:
+        """OpenR1-Math-220k default split: DeepSeek-R1 CoT verificati."""
+        print("Loading OpenR1-Math-220k default stream...")
+        try:
+            ds = load_dataset(
+                "open-r1/OpenR1-Math-220k",
+                "default",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  OpenR1-Math failed: {e}, falling back to MetaMathQA")
+            return self._get_metamath_stream()
+
+    def _get_openmath_reasoning_stream(self) -> Iterator:
+        """NVIDIA OpenMathReasoning: 306K AoPS problems, R1/QwQ solutions."""
+        print("Loading NVIDIA OpenMathReasoning (cot split) stream...")
+        try:
+            ds = load_dataset(
+                "nvidia/OpenMathReasoning",
+                split="cot",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  OpenMathReasoning failed: {e}, falling back to OpenR1-Math")
+            return self._get_openr1_math_stream()
+
+    def _get_natural_reasoning_stream(self) -> Iterator:
+        """Meta NaturalReasoning: 1.15M general reasoning backtranslated."""
+        print("Loading Meta NaturalReasoning stream...")
+        try:
+            ds = load_dataset(
+                "facebook/natural_reasoning",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  NaturalReasoning failed: {e}")
+            return iter([])
+
+    def _get_nemotron_sft_v1_stream(self) -> Iterator:
+        """NVIDIA Nemotron-Pretraining-SFT v1: STEM/code/math SFT."""
+        print("Loading Nemotron-Pretraining-SFT v1 stream...")
+        try:
+            ds = load_dataset(
+                "nvidia/Nemotron-Pretraining-SFT-v1",
+                split="train",
+                streaming=True,
+                token=self.hf_token
+            )
+            return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=500))
+        except Exception as e:
+            print(f"  Nemotron-SFT v1 failed: {e}, falling back to Tulu 3")
+            return self._get_tulu3_stream()
+
     # ========== Sample Getters ==========
+
+    _STREAM_DISPATCH = {
+        # Foundation web (EN)
+        'fineweb_edu': '_get_fineweb_edu_stream',
+        'dclm_baseline': '_get_dclm_baseline_stream',
+        'nemotron_cc_v2': '_get_nemotron_cc_v2_stream',
+        'cosmopedia': '_get_cosmopedia_stream',
+        # Math + code
+        'stack_v2_smol': '_get_stack_v2_smol_stream',
+        'finemath_4plus': '_get_finemath_4plus_stream',
+        'nemotron_cc_math': '_get_nemotron_cc_math_stream',
+        'openwebmath': '_get_openwebmath_stream',
+        'proof_pile_2': '_get_proof_pile_2_stream',
+        'mathcode_pile': '_get_mathcode_pile_stream',
+        'starcoder_pr': '_get_starcoder_pr_stream',
+        # Reasoning + Instruction (top tier)
+        'openr1_math': '_get_openr1_math_stream',
+        'openmath_reasoning': '_get_openmath_reasoning_stream',
+        'natural_reasoning': '_get_natural_reasoning_stream',
+        'tulu3': '_get_tulu3_stream',
+        'nemotron_sft_v1': '_get_nemotron_sft_v1_stream',
+        # Legacy / fallback sources
+        'openhermes': '_get_openhermes_stream',
+        'metamath': '_get_metamath_stream',
+        'magpie': '_get_magpie_stream',
+        'codealpaca': '_get_codealpaca_stream',
+        'stack': '_get_stack_stream',
+        'culturax_it': '_get_culturax_it_stream',
+        'wikipedia_it': '_get_wikipedia_it_stream',
+        'english_mix': '_get_fineweb_edu_stream',
+        'openorca': '_get_openorca_stream',
+        'fauno_it': '_get_fauno_it_stream',
+        'alpaca_it': '_get_alpaca_it_stream',
+        'dolly': '_get_dolly_stream',
+    }
 
     def _get_stream(self, source: str) -> Iterator:
         """Get or create stream for source."""
         if self._iterators.get(source) is None:
-            if source == 'fineweb_edu':
-                self._iterators[source] = self._get_fineweb_edu_stream()
-            elif source == 'cosmopedia':
-                self._iterators[source] = self._get_cosmopedia_stream()
-            elif source == 'openwebmath':
-                self._iterators[source] = self._get_openwebmath_stream()
-            elif source == 'stack':
-                self._iterators[source] = self._get_stack_stream()
-            elif source == 'culturax_it':
-                self._iterators[source] = self._get_culturax_it_stream()
-            elif source == 'wikipedia_it':
-                self._iterators[source] = self._get_wikipedia_it_stream()
-            elif source == 'english_mix':
-                # For maintenance, alternate between FineWeb and Cosmopedia
-                self._iterators[source] = self._get_fineweb_edu_stream()
-            elif source == 'openorca':
-                self._iterators[source] = self._get_openorca_stream()
-            elif source == 'fauno_it':
-                self._iterators[source] = self._get_fauno_it_stream()
-            elif source == 'alpaca_it':
-                self._iterators[source] = self._get_alpaca_it_stream()
-            elif source == 'local_it':
+            if source == 'local_it':
                 # Local instructions don't need a stream
-                pass
-            elif source == 'dolly':
-                self._iterators[source] = self._get_dolly_stream()
-            elif source == 'codealpaca':
-                self._iterators[source] = self._get_codealpaca_stream()
-            else:
+                return None
+            method_name = self._STREAM_DISPATCH.get(source)
+            if method_name is None:
                 raise ValueError(f"Unknown source: {source}")
+            self._iterators[source] = getattr(self, method_name)()
 
         return self._iterators.get(source)
 
@@ -420,9 +692,62 @@ class EllediDatasetV2(IterableDataset):
             item = next(stream)
 
             # Extract text based on source format
-            if source in ['fineweb_edu', 'cosmopedia', 'openwebmath', 'stack',
-                          'culturax_it', 'wikipedia_it', 'english_mix']:
-                text = item.get("text", "")
+            plain_text_sources = {
+                'fineweb_edu', 'dclm_baseline', 'nemotron_cc_v2', 'cosmopedia',
+                'stack_v2_smol', 'finemath_4plus', 'nemotron_cc_math',
+                'openwebmath', 'proof_pile_2', 'mathcode_pile', 'starcoder_pr',
+                'stack', 'culturax_it', 'wikipedia_it', 'english_mix',
+            }
+            messages_sources = {'tulu3', 'openhermes', 'magpie', 'nemotron_sft_v1'}
+
+            if source in plain_text_sources:
+                # HF datasets standard "text" field; some use "content" or "raw_content"
+                text = item.get("text") or item.get("content") or item.get("raw_content") or ""
+            elif source in messages_sources:
+                # ChatML-formatted multi-turn: {"messages": [{"role": ..., "content": ...}, ...]}
+                messages = item.get("messages") or item.get("conversations") or []
+                parts = []
+                for m in messages:
+                    role = m.get("role") or m.get("from") or "user"
+                    content = m.get("content") or m.get("value") or ""
+                    if not content:
+                        continue
+                    role_norm = "assistant" if role in ("assistant", "gpt", "model") else "user"
+                    parts.append(f"<|im_start|>{role_norm}\n{content}<|im_end|>")
+                text = "\n".join(parts)
+            elif source == 'openr1_math':
+                # OpenR1-Math: prefer "messages" field if present, else build from problem+solution
+                messages = item.get("messages") or []
+                if messages:
+                    parts = []
+                    for m in messages:
+                        role = m.get("role") or "user"
+                        content = m.get("content") or ""
+                        if not content:
+                            continue
+                        role_norm = "assistant" if role == "assistant" else "user"
+                        parts.append(f"<|im_start|>{role_norm}\n{content}<|im_end|>")
+                    text = "\n".join(parts)
+                else:
+                    problem = item.get("problem", "")
+                    solution = item.get("solution", "")
+                    text = self._format_chatml(problem, solution) if problem and solution else ""
+            elif source == 'openmath_reasoning':
+                # NVIDIA OpenMathReasoning: problem + generated_solution
+                problem = item.get("problem", "")
+                solution = item.get("generated_solution", "")
+                text = self._format_chatml(problem, solution) if problem and solution else ""
+            elif source == 'natural_reasoning':
+                # Meta NaturalReasoning: question + responses[0].response
+                question = item.get("question", "")
+                responses = item.get("responses") or []
+                response = responses[0].get("response", "") if responses else item.get("reference_answer", "")
+                text = self._format_chatml(question, response) if question and response else ""
+            elif source == 'metamath':
+                # MetaMathQA format: {"query": ..., "response": ...}
+                query = item.get("query") or item.get("question") or ""
+                response = item.get("response") or item.get("answer") or ""
+                text = self._format_chatml(query, response) if query and response else ""
             elif source == 'openorca':
                 # OpenOrca format
                 system = item.get("system_prompt", "")
