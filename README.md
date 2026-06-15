@@ -2,6 +2,8 @@
 
 Hybrid LLM Architecture: Mamba-2 SSD + EG-MLA + BitNet INT2.
 
+![Elleci Architecture](./docs/architecture_overview.png)
+
 This repository contains the training framework and architectural definition for Elleci, an experimental hybrid language model leveraging ternary quantization.
 
 ## Current Status
@@ -9,6 +11,11 @@ This repository contains the training framework and architectural definition for
 * **Quantization Kernel:** INT2 Tensor Core CUDA kernels implemented and tested via unit tests.
 * **Training Pipeline:** Configured for 3-phase curriculum.
 * **Validation:** Currently in "advanced proof-of-concept" stage. Full-scale convergence and benchmarks on the 7B configuration have not yet been documented. 
+
+## Reproducibility / What has actually been tested
+* **Unit Tests:** Operations like `MuonOptimizer`, `HESTIA`, `ProRes`, and custom CUDA Tensor Core operations pass the automated test suite.
+* **Dry-runs:** The training script successfully initializes the model, compiles the Triton/CUDA kernels, loads the streaming dataset, and performs forward/backward steps without OOM on single-GPU setups matching the configs.
+* **Full Training:** **Not yet verified**. We do not have loss curves, evaluation scores, or checkpoint validation for a complete pre-training run at the 7B scale.
 
 ## Quick Start (vast.ai / A100)
 
