@@ -64,9 +64,19 @@ training:
   # CPU offload for activations (disabled: Mamba checkpointing is enough)
   enable_offload: false
 
+  # SWA / model averaging (C2) — col curriculum meglio del decay aggressivo (cf. 2511.18903;
+  # nota: min_lr=3e-5 = 10% del peak è un decay forte → SWA lo mitiga)
+  use_swa: true
+  swa_start_ratio: 0.80
+  swa_update_interval: 100
+
+  # B3 — warmup procedurale (Dyck/parentesi) nei primi step (~0.3%)
+  procedural_warmup_steps: 150
+
 data:
   tokenizer_path: "tokenizer/tokenizer.json"
   streaming: true
+  dedup: true               # B2 (gestito nel dataset; default on)
   seed: 42
 
 optimizations:

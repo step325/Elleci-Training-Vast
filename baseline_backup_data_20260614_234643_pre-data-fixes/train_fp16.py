@@ -271,16 +271,11 @@ def build_dataloader(phase: int, cfg: dict, elleci_config: ElleciConfig):
 
         raw_tok = Tokenizer.from_file(str(tokenizer_path))
 
-        # A1: eos/pad risolti dai metadati reali del tokenizer (prima hardcoded 2/0, errati:
-        # eos=2 era <|im_start|>, pad=0 era <|endoftext|>).
-        _eos = raw_tok.token_to_id("<|im_end|>")
-        _pad = raw_tok.token_to_id("<|padding|>")
-
         class _Wrap:
             def __init__(self, t):
                 self._t = t
-                self.eos_token_id = _eos if _eos is not None else 0
-                self.pad_token_id = _pad if _pad is not None else 1
+                self.eos_token_id = 2
+                self.pad_token_id = 0
             def encode(self, text):
                 return self._t.encode(text).ids
 
@@ -296,13 +291,8 @@ def build_dataloader(phase: int, cfg: dict, elleci_config: ElleciConfig):
             def __init__(self, ds):
                 self._ds = ds
             def __iter__(self):
-                # A3: il dataset ora restituisce (input, labels) con prompt mascherato
-                for item in self._ds:
-                    if isinstance(item, tuple):
-                        inp, lab = item
-                    else:
-                        inp, lab = item, item.clone()
-                    yield {"input_ids": inp, "labels": lab}
+                for batch in self._ds:
+                    yield {"input_ids": batch, "labels": batch.clone()}
 
         print(f"  Data: EllediDatasetV2 Phase {phase}")
         return _Loader(dataset)
@@ -315,48 +305,6 @@ def build_dataloader(phase: int, cfg: dict, elleci_config: ElleciConfig):
             train_cfg["seq_len"],
             num_batches=cfg["training"]["max_steps"] * 4,
         )
-
-
-def build_val_loader(cfg: dict, vocab_size: int, n_batches: int = 50):
-    """A2: held-out di validazione su dati REALI (non più random sintetici).
-
-    Materializza n_batches dalla Fase 1 con seed 1234 (≠ train) e li congela in lista.
-    """
-    data_cfg = cfg.get("data", {})
-    train_cfg = cfg["training"]
-    try:
-        from data.elleci_dataset_v2 import EllediDatasetV2
-        from tokenizers import Tokenizer
-        tp = ROOT_DIR / data_cfg.get("tokenizer_path", "tokenizer/tokenizer.json")
-        raw_tok = Tokenizer.from_file(str(tp))
-        eos = raw_tok.token_to_id("<|im_end|>")
-        pad = raw_tok.token_to_id("<|padding|>")
-
-        class _W:
-            def __init__(self, t):
-                self._t = t
-                self.eos_token_id = eos if eos is not None else 0
-                self.pad_token_id = pad if pad is not None else 1
-            def encode(self, text):
-                return self._t.encode(text).ids
-
-        ds = EllediDatasetV2(tokenizer=_W(raw_tok), phase=1, max_length=train_cfg["seq_len"],
-                             batch_size=train_cfg["batch_size"], seed=1234)
-        out, it = [], iter(ds)
-        for _ in range(n_batches):
-            try:
-                item = next(it)
-            except StopIteration:
-                break
-            inp, lab = item if isinstance(item, tuple) else (item, item.clone())
-            out.append({"input_ids": inp, "labels": lab})
-        if out:
-            print(f"  Val: {len(out)} batch reali held-out (seed 1234)")
-            return out
-        raise RuntimeError("val vuota")
-    except Exception as e:
-        print(f"  Val reale fallita ({e}); uso sintetica (val loss NON significativa)")
-        return SyntheticDataLoader(vocab_size, train_cfg["batch_size"], train_cfg["seq_len"], num_batches=200)
 
 
 # ---------------------------------------------------------------------------
@@ -382,97 +330,6 @@ def evaluate(model, val_loader, device, amp_dtype, max_batches=50):
     model.train()
     avg_loss = total_loss / max(count, 1)
     return {"val_loss": avg_loss, "val_ppl": math.exp(min(avg_loss, 20))}
-
-
-# ---------------------------------------------------------------------------
-# B3 — procedural warmup
-# ---------------------------------------------------------------------------
-
-def build_procedural_loader(cfg: dict):
-    """B3: loader di warmup procedurale (Dyck/parentesi) — generato on-the-fly, no rete."""
-    from data.elleci_dataset_v2 import ProceduralWarmupDataset
-    from tokenizers import Tokenizer
-    data_cfg = cfg.get("data", {})
-    train_cfg = cfg["training"]
-    tp = ROOT_DIR / data_cfg.get("tokenizer_path", "tokenizer/tokenizer.json")
-    raw_tok = Tokenizer.from_file(str(tp))
-    eos = raw_tok.token_to_id("<|im_end|>")
-
-    class _W:
-        def __init__(self, t):
-            self._t = t
-            self.eos_token_id = eos if eos is not None else 0
-        def encode(self, text):
-            return self._t.encode(text).ids
-
-    ds = ProceduralWarmupDataset(tokenizer=_W(raw_tok), max_length=train_cfg["seq_len"],
-                                 batch_size=train_cfg["batch_size"], seed=42)
-
-    class _Loader:
-        def __init__(self, d):
-            self._d = d
-        def __iter__(self):
-            for inp, lab in self._d:
-                yield {"input_ids": inp, "labels": lab}
-
-    print("  Data: ProceduralWarmupDataset (B3 warmup)")
-    return _Loader(ds)
-
-
-def _data_spec_fp16(step: int, cfg: dict):
-    """('proc',0) durante il warmup procedurale (B3), poi ('phase', n)."""
-    proc = int(cfg.get("training", {}).get("procedural_warmup_steps", 0))
-    if step < proc:
-        return ("proc", 0)
-    return ("phase", _get_phase(step, cfg))
-
-
-def build_loader_for_spec_fp16(spec, cfg: dict, elleci_config):
-    if spec[0] == "proc":
-        return build_procedural_loader(cfg)
-    return build_dataloader(spec[1], cfg, elleci_config)
-
-
-# ---------------------------------------------------------------------------
-# SWA / model averaging (C2)
-# ---------------------------------------------------------------------------
-
-class SWAManager:
-    """C2 — model averaging (running mean su CPU dei tensori float dello state_dict).
-
-    Con curriculum a qualità crescente è preferibile al decay LR aggressivo
-    (arXiv 2511.18903). Mirror della classe in train.py.
-    """
-    def __init__(self, swa_start_step: int, update_interval: int = 100):
-        self.start = swa_start_step
-        self.interval = max(1, update_interval)
-        self.avg = None
-        self.n = 0
-
-    @torch.no_grad()
-    def maybe_update(self, model, step: int):
-        if step < self.start or (step % self.interval) != 0:
-            return
-        sd = model.state_dict()
-        if self.avg is None:
-            self.avg = {k: v.detach().float().cpu().clone()
-                        for k, v in sd.items() if v.is_floating_point()}
-            self.n = 1
-        else:
-            self.n += 1
-            for k, v in sd.items():
-                if k in self.avg:
-                    self.avg[k].add_((v.detach().float().cpu() - self.avg[k]) / self.n)
-
-    @torch.no_grad()
-    def apply_to(self, model) -> bool:
-        if self.avg is None:
-            return False
-        sd = model.state_dict()
-        for k, v in self.avg.items():
-            if k in sd:
-                sd[k].copy_(v.to(device=sd[k].device, dtype=sd[k].dtype))
-        return True
 
 
 # ---------------------------------------------------------------------------
@@ -531,13 +388,6 @@ def train(cfg: dict, dry_run: bool = False, resume_path: str = None,
     # ---- Optimizer ----
     optimizer = build_optimizer(model, cfg)
 
-    # ---- SWA / model averaging (C2) ----
-    swa = None
-    if train_cfg.get("use_swa", False):
-        swa_start = int(train_cfg.get("swa_start_ratio", 0.80) * train_cfg["max_steps"])
-        swa = SWAManager(swa_start, update_interval=train_cfg.get("swa_update_interval", 100))
-        print(f"  SWA enabled: start step {swa_start}")
-
     # GradScaler only for fp16 (bf16 is numerically stable without it)
     scaler = GradScaler(enabled=(precision == "fp16"))
 
@@ -550,9 +400,14 @@ def train(cfg: dict, dry_run: bool = False, resume_path: str = None,
 
     # ---- Data ----
     print("\nPreparing data...")
-    current_spec = _data_spec_fp16(start_step, cfg)
-    train_loader = build_loader_for_spec_fp16(current_spec, cfg, elleci_config)
-    val_loader = build_val_loader(cfg, elleci_config.vocab_size, n_batches=50)  # A2: val reale
+    current_phase = _get_phase(start_step, cfg)
+    train_loader = build_dataloader(current_phase, cfg, elleci_config)
+    val_loader = SyntheticDataLoader(
+        elleci_config.vocab_size,
+        train_cfg["batch_size"],
+        train_cfg["seq_len"],
+        num_batches=200,
+    )
 
     # ---- WandB ----
     log_cfg = cfg.get("logging", {})
@@ -584,7 +439,7 @@ def train(cfg: dict, dry_run: bool = False, resume_path: str = None,
     print(f"\nStarting training: steps {start_step} → {max_steps}")
     print(f"  Tokens/step: {tokens_per_step:,}")
     print(f"  Total tokens: {max_steps * tokens_per_step / 1e9:.2f}B")
-    print(f"  Data spec iniziale: {current_spec}")
+    print(f"  Phase: {current_phase}")
     print()
 
     model.train()
@@ -598,13 +453,12 @@ def train(cfg: dict, dry_run: bool = False, resume_path: str = None,
     data_iter = iter(train_loader)
 
     while step < max_steps:
-        # R2/B3: switch sorgente dati (proc warmup → fasi)
-        new_spec = _data_spec_fp16(step, cfg)
-        if new_spec != current_spec:
-            current_spec = new_spec
-            label = "procedural warmup (B3)" if new_spec[0] == "proc" else f"Phase {new_spec[1]}"
-            print(f"\n>>> Switch dati: {label} at step {step}")
-            train_loader = build_loader_for_spec_fp16(new_spec, cfg, elleci_config)
+        # Phase switch
+        new_phase = _get_phase(step, cfg)
+        if new_phase != current_phase:
+            current_phase = new_phase
+            print(f"\n>>> Switching to Phase {current_phase} at step {step}")
+            train_loader = build_dataloader(current_phase, cfg, elleci_config)
             data_iter = iter(train_loader)
 
         # LR
@@ -646,10 +500,6 @@ def train(cfg: dict, dry_run: bool = False, resume_path: str = None,
         step_loss = accum_loss
         accum_loss = 0.0
 
-        # SWA (C2): aggiorna la media dei pesi dopo ogni optimizer step
-        if swa is not None:
-            swa.maybe_update(model, step)
-
         # Logging
         if step % log_every == 0:
             elapsed = time.time() - t_start
@@ -662,7 +512,7 @@ def train(cfg: dict, dry_run: bool = False, resume_path: str = None,
                 f"loss {step_loss:.4f} | ppl {ppl:.1f} | "
                 f"lr {lr:.2e} | gnorm {grad_norm:.2f} | "
                 f"tok/s {tok_per_sec:.0f} | "
-                f"mem {mem_gb:.1f}GB | data {current_spec}"
+                f"mem {mem_gb:.1f}GB | phase {current_phase}"
             )
 
             if use_wandb:
@@ -673,8 +523,7 @@ def train(cfg: dict, dry_run: bool = False, resume_path: str = None,
                     "train/grad_norm": grad_norm,
                     "train/tok_per_sec": tok_per_sec,
                     "train/mem_gb": mem_gb,
-                    "train/data_mode": current_spec[0],
-                    "train/phase": current_spec[1],
+                    "train/phase": current_phase,
                     "step": step,
                 })
 
@@ -706,10 +555,6 @@ def train(cfg: dict, dry_run: bool = False, resume_path: str = None,
         # Periodic checkpoint
         if step % save_every == 0:
             save_checkpoint(model, optimizer, step, step_loss, cfg, output_dir)
-
-    # SWA (C2): applica i pesi mediati prima del checkpoint finale
-    if swa is not None and swa.apply_to(model):
-        print("  SWA: pesi mediati applicati al modello finale")
 
     # Final checkpoint
     save_checkpoint(model, optimizer, step, step_loss, cfg, output_dir)

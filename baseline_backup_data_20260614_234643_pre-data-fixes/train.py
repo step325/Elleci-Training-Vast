@@ -100,9 +100,6 @@ def parse_args():
     parser = argparse.ArgumentParser(description="Train Elleci INT2")
     parser.add_argument("--config", type=str, default=str(Path(__file__).parent / "configs" / "a100_7b.yaml"))
     parser.add_argument("--resume", type=str, default=None)
-    parser.add_argument("--init-from-fp16", type=str, default=None,
-                        help="C3: checkpoint FP16 (train_fp16.py) da cui partire PRIMA della "
-                             "conversione INT2 (continual QAT 16→1.58, cf. arXiv 2502.11895)")
     parser.add_argument("--dry-run", action="store_true", help="Quick test with tiny model")
     parser.add_argument("--no-wandb", action="store_true")
     parser.add_argument("--local-rank", type=int, default=0)  # Per compatibilita
@@ -157,127 +154,51 @@ def curriculum_phase(step: int, max_steps: int, config: dict) -> int:
     return 3
 
 
-def load_tokenizer_wrapper(config: dict, root_dir):
-    """A1: carica il tokenizer e risolve eos/pad DAI metadati reali del tokenizer.
-
-    Prima erano hardcoded eos=2 (=<|im_start|>!) e pad=0 (=<|endoftext|>), errati:
-    i documenti venivano separati da <|im_start|> invece che da <|im_end|>.
-    """
-    from tokenizers import Tokenizer
-    tokenizer_path = root_dir / config["data"]["tokenizer_path"]
-    if not tokenizer_path.exists():
-        raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
-    tok = Tokenizer.from_file(str(tokenizer_path))
-    eos_id = tok.token_to_id("<|im_end|>")
-    pad_id = tok.token_to_id("<|padding|>")
-
-    class TokenizerWrapper:
-        def __init__(self):
-            self._tokenizer = tok
-            self.eos_token_id = eos_id if eos_id is not None else 0
-            self.pad_token_id = pad_id if pad_id is not None else 1
-        def encode(self, text):
-            return self._tokenizer.encode(text).ids
-
-    return TokenizerWrapper()
-
-
-class _RealDataLoader:
-    """Adatta EllediDatasetV2 (che ora restituisce (input, labels)) a dict batch.
-    A3: usa le labels mascherate del dataset invece di input.clone()."""
-    def __init__(self, ds, max_batches):
-        self.dataset = ds
-        self.max_batches = max_batches
-    def __iter__(self):
-        count = 0
-        for item in self.dataset:
-            if count >= self.max_batches:
-                break
-            if isinstance(item, tuple):
-                inp, lab = item
-            else:
-                inp, lab = item, item.clone()
-            yield {"input_ids": inp, "labels": lab}
-            count += 1
-    def __len__(self):
-        return self.max_batches
-
-
 def build_real_train_loader(phase: int, config: dict, root_dir):
-    """R2: costruisce il loader (EllediDatasetV2) per la fase indicata.
+    """R2: costruisce il RealDataLoader (EllediDatasetV2) per la fase indicata.
 
     Solleva eccezione su errore (il chiamante gestisce il fallback sintetico).
     """
     from data.elleci_dataset_v2 import EllediDatasetV2
+    from tokenizers import Tokenizer
 
     train_cfg = config["training"]
-    data_cfg = config.get("data", {})
+    tokenizer_path = root_dir / config["data"]["tokenizer_path"]
+    if not tokenizer_path.exists():
+        raise FileNotFoundError(f"Tokenizer not found: {tokenizer_path}")
+    tokenizer = Tokenizer.from_file(str(tokenizer_path))
+
+    class TokenizerWrapper:
+        def __init__(self, tok):
+            self._tokenizer = tok
+            self.eos_token_id = 2  # Standard EOS
+            self.pad_token_id = 0  # Standard PAD
+        def encode(self, text):
+            return self._tokenizer.encode(text).ids
+
     dataset = EllediDatasetV2(
-        tokenizer=load_tokenizer_wrapper(config, root_dir),
+        tokenizer=TokenizerWrapper(tokenizer),
         phase=phase,
         max_length=train_cfg["seq_len"],
         batch_size=train_cfg["batch_size"],
         seed=42,
-        dedup=data_cfg.get("dedup", True),                      # B2
-        dedup_capacity=data_cfg.get("dedup_capacity", 5_000_000),
     )
-    return _RealDataLoader(dataset, config["training"]["max_steps"] * 2)
 
+    class RealDataLoader:
+        def __init__(self, ds, max_batches):
+            self.dataset = ds
+            self.max_batches = max_batches
+        def __iter__(self):
+            count = 0
+            for batch in self.dataset:
+                if count >= self.max_batches:
+                    break
+                yield {"input_ids": batch, "labels": batch.clone()}
+                count += 1
+        def __len__(self):
+            return self.max_batches
 
-def build_procedural_loader(config: dict, root_dir):
-    """B3: loader di warmup procedurale (sequenze di Dyck/parentesi bilanciate)."""
-    from data.elleci_dataset_v2 import ProceduralWarmupDataset
-    train_cfg = config["training"]
-    ds = ProceduralWarmupDataset(
-        tokenizer=load_tokenizer_wrapper(config, root_dir),
-        max_length=train_cfg["seq_len"],
-        batch_size=train_cfg["batch_size"],
-        seed=42,
-    )
-    return _RealDataLoader(ds, config["training"]["max_steps"] * 2)
-
-
-def data_spec(step: int, max_steps: int, config: dict):
-    """Sorgente dati attiva per lo step: ('proc',0) durante il warmup procedurale (B3),
-    poi ('phase', n) per il curriculum (R2)."""
-    proc = int(config.get("training", {}).get("procedural_warmup_steps", 0))
-    if step < proc:
-        return ("proc", 0)
-    return ("phase", curriculum_phase(step, max_steps, config))
-
-
-def build_loader_for_spec(spec, config: dict, root_dir):
-    """Costruisce il loader corrispondente allo spec di data_spec()."""
-    if spec[0] == "proc":
-        return build_procedural_loader(config, root_dir)
-    return build_real_train_loader(spec[1], config, root_dir)
-
-
-def build_real_val_loader(config: dict, root_dir, n_batches: int = 50):
-    """A2: held-out di validazione su dati REALI (non più random sintetici).
-
-    Materializza n_batches dalla Fase 1 con seed diverso dal train (1234 vs 42) e
-    li congela in una lista, così la val loss è significativa e stabile tra le eval.
-    """
-    from data.elleci_dataset_v2 import EllediDatasetV2
-
-    train_cfg = config["training"]
-    dataset = EllediDatasetV2(
-        tokenizer=load_tokenizer_wrapper(config, root_dir),
-        phase=1,
-        max_length=train_cfg["seq_len"],
-        batch_size=train_cfg["batch_size"],
-        seed=1234,
-    )
-    batches, it = [], iter(dataset)
-    for _ in range(n_batches):
-        try:
-            item = next(it)
-        except StopIteration:
-            break
-        inp, lab = item if isinstance(item, tuple) else (item, item.clone())
-        batches.append({"input_ids": inp, "labels": lab})
-    return batches
+    return RealDataLoader(dataset, config["training"]["max_steps"] * 2)
 
 
 def ns_step(G: torch.Tensor, steps: int = 5) -> torch.Tensor:
@@ -345,47 +266,6 @@ class MuonOptimizer(torch.optim.Optimizer):
                 p.data.add_(g_orth, alpha=-group['lr'])
 
         return loss
-
-
-class SWAManager:
-    """C2 — Stochastic Weight Averaging / model averaging.
-
-    Media (running mean a peso uguale) i tensori FLOAT dello state_dict a partire da
-    swa_start_step, salvati su CPU per non gonfiare la VRAM. I buffer interi (W_packed/
-    H_packed/_step degli INT2) NON sono mediabili → si mantiene l'ultimo valore.
-    Coerente con arXiv 2511.18903: con un curriculum a qualità crescente, il model
-    averaging è preferibile al decay LR aggressivo (che "spreca" i dati migliori finali).
-    """
-    def __init__(self, swa_start_step: int, update_interval: int = 100):
-        self.start = swa_start_step
-        self.interval = max(1, update_interval)
-        self.avg = None
-        self.n = 0
-
-    @torch.no_grad()
-    def maybe_update(self, model, step: int):
-        if step < self.start or (step % self.interval) != 0:
-            return
-        sd = model.state_dict()
-        if self.avg is None:
-            self.avg = {k: v.detach().float().cpu().clone()
-                        for k, v in sd.items() if v.is_floating_point()}
-            self.n = 1
-        else:
-            self.n += 1
-            for k, v in sd.items():
-                if k in self.avg:
-                    self.avg[k].add_((v.detach().float().cpu() - self.avg[k]) / self.n)
-
-    @torch.no_grad()
-    def apply_to(self, model) -> bool:
-        if self.avg is None:
-            return False
-        sd = model.state_dict()
-        for k, v in self.avg.items():
-            if k in sd:
-                sd[k].copy_(v.to(device=sd[k].device, dtype=sd[k].dtype))
-        return True
 
 
 class INT2Trainer:
@@ -501,16 +381,6 @@ class INT2Trainer:
 
         # Warmup
         self.warmup_steps = train_cfg["warmup_steps"]
-
-        # SWA / model averaging (C2) — preferito al decay aggressivo col curriculum
-        self.use_swa = train_cfg.get("use_swa", False)
-        if self.use_swa:
-            max_steps = train_cfg["max_steps"]
-            swa_start = int(train_cfg.get("swa_start_ratio", 0.80) * max_steps)
-            self.swa = SWAManager(swa_start, update_interval=train_cfg.get("swa_update_interval", 100))
-            print(f"SWA enabled: start step {swa_start}, update ogni {self.swa.interval} step")
-        else:
-            self.swa = None
 
     def get_lr(self, base_lr: float) -> float:
         """Learning rate con linear warmup."""
@@ -1032,18 +902,6 @@ def main():
     print("\nCreating model...")
     model = Elleci(elleci_config)
 
-    # C3 (16→1.58): inizializza da pesi FP16 ADDESTRATI prima di quantizzare a INT2.
-    # Continual QAT: l'INT2 parte da pesi buoni (meno loss spike, qualità migliore;
-    # cf. arXiv 2502.11895). La forza di quantizzazione cresce poi via HESTIA (int2_threshold_init).
-    init_fp16 = args.init_from_fp16 or config.get("checkpointing", {}).get("init_from_fp16")
-    if init_fp16:
-        print(f"\n[16→1.58] Init da checkpoint FP16: {init_fp16}")
-        _ck = torch.load(init_fp16, map_location="cpu", weights_only=False)
-        _sd = _ck.get("model_state_dict", _ck)
-        _missing, _unexpected = model.load_state_dict(_sd, strict=False)
-        print(f"[16→1.58] Pesi FP16 caricati (missing={len(_missing)}, unexpected={len(_unexpected)}) "
-              f"→ verranno quantizzati a ternario dalla conversione INT2")
-
     # Phase 2 optimization: disable CPU offload (sync elimination saves more than offload)
     # setup_offload_manager(300)  # Disabled: offload adds 378 GPU↔CPU ops/step
 
@@ -1122,15 +980,12 @@ def main():
         # Real training: EllediDatasetV2 con curriculum a fasi. Il train_loader reale è creato
         # dopo il resume (così la fase iniziale riflette lo step ripristinato) — vedi R2.
         train_loader = None
-        # A2: validazione su dati REALI held-out (non più random sintetici → val loss significativa)
-        try:
-            val_loader = build_real_val_loader(config, ROOT_DIR, n_batches=50)
-            print(f"✓ Validation: {len(val_loader)} batch reali held-out (Fase 1, seed 1234)")
-        except Exception as e:
-            print(f"⚠ Val reale fallita ({e}); uso sintetica (val loss NON significativa)")
-            val_loader = SyntheticDataLoader(
-                elleci_config.vocab_size, train_cfg["batch_size"], train_cfg["seq_len"], num_batches=100
-            )
+        val_loader = SyntheticDataLoader(
+            elleci_config.vocab_size,
+            train_cfg["batch_size"],
+            train_cfg["seq_len"],
+            num_batches=100
+        )
 
     # Trainer
     trainer = INT2Trainer(model, config, device)
@@ -1141,19 +996,14 @@ def main():
     elif config["checkpointing"].get("resume_from"):
         trainer.load_checkpoint(config["checkpointing"]["resume_from"])
 
-    # R2/B3: costruisci il train_loader per lo spec corrente (proc warmup o fase) dopo il resume.
+    # R2: costruisci il train_loader reale per la fase curriculum corrente (dopo il resume).
     use_real_data = False
-    current_spec = None
     if not args.dry_run and train_loader is None:
-        current_spec = data_spec(trainer.global_step, config["training"]["max_steps"], config)
+        _phase = curriculum_phase(trainer.global_step, config["training"]["max_steps"], config)
         try:
-            train_loader = build_loader_for_spec(current_spec, config, ROOT_DIR)
+            train_loader = build_real_train_loader(_phase, config, ROOT_DIR)
             use_real_data = True
-            if current_spec[0] == "proc":
-                print(f"✓ B3: procedural warmup per i primi "
-                      f"{config['training'].get('procedural_warmup_steps')} step")
-            else:
-                print(f"✓ Using REAL data — curriculum Fase {current_spec[1]} (EllediDatasetV2 streaming)")
+            print(f"✓ Using REAL data — curriculum Fase {_phase} (EllediDatasetV2 streaming)")
         except Exception as e:
             print(f"⚠ Failed to load real data: {e}\n  Falling back to synthetic data...")
             train_loader = SyntheticDataLoader(
@@ -1188,20 +1038,20 @@ def main():
     log_steps = 0
 
     train_iter = iter(train_loader)
+    current_phase = curriculum_phase(trainer.global_step, max_steps, config) if use_real_data else None
 
     while trainer.global_step < max_steps:
-        # R2/B3: switch sorgente dati (proc warmup → fasi curriculum) al cambio spec.
+        # R2: switch fase curriculum (solo dati reali) — ricrea lo stream al cambio fase.
         if use_real_data:
-            spec = data_spec(trainer.global_step, max_steps, config)
-            if spec != current_spec:
-                current_spec = spec
-                label = "procedural warmup (B3)" if spec[0] == "proc" else f"Fase {spec[1]}"
-                print(f"\n>>> Switch dati: {label} (step {trainer.global_step})")
+            ph = curriculum_phase(trainer.global_step, max_steps, config)
+            if ph != current_phase:
+                current_phase = ph
+                print(f"\n>>> Curriculum: passaggio a Fase {ph} (step {trainer.global_step})")
                 try:
-                    train_loader = build_loader_for_spec(spec, config, ROOT_DIR)
+                    train_loader = build_real_train_loader(ph, config, ROOT_DIR)
                     train_iter = iter(train_loader)
                 except Exception as e:
-                    print(f"⚠ Rebuild loader ({label}) fallito: {e}; mantengo loader corrente")
+                    print(f"⚠ Rebuild loader fase {ph} fallito: {e}; mantengo loader corrente")
 
         try:
             batch = next(train_iter)
@@ -1211,10 +1061,6 @@ def main():
 
         # Train step
         metrics = trainer.train_step(batch)
-
-        # SWA (C2): aggiorna la media dei pesi dopo ogni optimizer step completato
-        if trainer.swa is not None and trainer.accum_count == 0:
-            trainer.swa.maybe_update(trainer.model, trainer.global_step)
 
         if metrics["loss"] > 0:  # Solo dopo gradient accumulation
             running_loss += metrics["loss"]
@@ -1288,10 +1134,6 @@ def main():
                 ckpt_cfg["output_dir"],
                 keep=ckpt_cfg.get("save_total_limit", 3)
             )
-
-    # SWA (C2): applica i pesi mediati al modello finale prima del salvataggio
-    if trainer.swa is not None and trainer.swa.apply_to(trainer.model):
-        print("SWA: pesi mediati applicati al modello finale")
 
     # Final save
     trainer.save_checkpoint(

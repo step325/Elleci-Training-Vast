@@ -337,9 +337,6 @@ class Elleci(nn.Module):
         self.gradient_checkpointing = False
         
     def _init_weights(self, module):
-        # R1: rispetta gli init speciali marcati (es. dt_proj di Mamba) — non sovrascriverli.
-        if getattr(module, '_skip_default_init', False):
-            return
         if isinstance(module, nn.Linear):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             if module.bias is not None:
@@ -347,16 +344,14 @@ class Elleci(nn.Module):
         elif isinstance(module, nn.Embedding):
             torch.nn.init.normal_(module.weight, mean=0.0, std=0.02)
             
-    def forward(self, idx, targets=None, return_hidden=False):
+    def forward(self, idx, targets=None):
         """
         Forward pass.
-
+        
         Args:
             idx: Token indices [batch, seq_len]
             targets: Target tokens [batch, seq_len] (for training)
-            return_hidden: Se True ritorna gli hidden states (post norm_f, pre lm_head) —
-                usato dal trainer per la fused linear cross-entropy (R6, niente logits).
-
+            
         Returns:
             logits: [batch, seq_len, vocab_size]
             loss: (Optional) cross-entropy loss
@@ -436,12 +431,7 @@ class Elleci(nn.Module):
 
         # Output normalization
         x = self.norm_f(x)
-
-        # R6: ritorna gli hidden states (pre lm_head) per la fused linear CE nel trainer
-        # (evita di materializzare i logits [batch, seq, vocab_size]).
-        if return_hidden:
-            return x
-
+        
         # Compute loss if targets provided
         loss = None
         logits = None

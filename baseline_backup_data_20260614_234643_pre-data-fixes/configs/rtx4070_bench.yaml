@@ -1,0 +1,77 @@
+# Elleci — RTX 4070 Benchmark (d_model=768, 12 layer, 1000 step)
+# Tutte e 5 le ottimizzazioni attive (sparse/hadamard disabilitati)
+# Dati: synthetic fallback (datasets non installato nel venv locale)
+
+model:
+  d_model: 768
+  n_layers: 12
+  n_heads: 12
+  use_moe: false
+  vocab_size: 32128
+  max_seq_len: 512
+
+  use_int2: true
+  int2_threshold: 7
+  int2_threshold_init: 7      # HESTIA: massimo rappresentabile in INT4 signed
+  use_24_sparsity: false      # Sparse-BitNet OFF (preserva qualita')
+  use_hadamard_int4: false    # BitNet v2 OFF (kernel CUDA non implementato)
+  int2_lr_scale: 5.0
+  int2_decay_rate: 0.001
+
+mamba:
+  use_matmul_ssd: true        # Matmul-based SSD (Tensor Core friendly)
+  use_checkpointing: true     # necessario: senza OOM a ~10.3 GB (display occupa ~1.2 GB)
+  use_cuda_ssd: false
+  chunk_size: 32
+  n_heads: 12
+  d_state: 16
+  expand: 2
+
+training:
+  max_steps: 1000
+  batch_size: 2
+  gradient_accumulation_steps: 4      # effective batch = 4x2x512 = 4096 tok/step
+  seq_len: 512
+
+  int2_lr: 0.1
+  adamw_lr: 0.0003
+  warmup_steps: 100                   # 10% del training
+  weight_decay: 0.01
+
+  mixed_precision: bf16
+  max_grad_norm: 1.0
+  enable_offload: false
+
+optimizations:
+  use_deepspeed: false
+  use_zero: false
+  cpu_offload: false
+  gradient_checkpointing: true
+  use_8bit_adamw: false
+  use_liger_cross_entropy: true
+  use_liger_rmsnorm: true
+  use_flash_attention: true
+  compile_model: false
+
+logging:
+  log_interval: 10                    # log ogni 10 step = 100 entry totali
+  eval_interval: 500
+  save_interval: 1000
+  wandb_project: "elleci-bench"
+  wandb_run_name: "rtx4070-768x12-1k"
+
+checkpointing:
+  output_dir: "checkpoints/bench_768x12"
+  save_total_limit: 1
+  resume_from: null
+
+data:
+  dataset: "fineweb-edu"              # fallback automatico a synthetic se datasets non installato
+  tokenizer_path: "tokenizer/tokenizer.json"
+  streaming: true
+  num_workers: 4
+
+evaluation:
+  eval_samples: 500
+  generate_samples: 3
+  max_new_tokens: 50

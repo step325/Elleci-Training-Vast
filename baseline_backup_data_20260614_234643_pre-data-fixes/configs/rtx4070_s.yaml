@@ -17,9 +17,7 @@ model:
 
   # INT2 specific
   use_int2: true
-  # C4 — HESTIA annealing: soglia alta iniziale → finale (tunabile)
-  int2_threshold: 4          # HESTIA target steady-state
-  int2_threshold_init: 7     # HESTIA: alta soglia iniziale = stabilità early
+  int2_threshold: 7
   int2_lr_scale: 5.0
   int2_decay_rate: 0.001
 
@@ -44,14 +42,6 @@ training:
 
   # CPU offload for INT2 activations
   enable_offload: false    # Disabled: sync elimination saves more than offload
-
-  # SWA / model averaging (C2)
-  use_swa: true
-  swa_start_ratio: 0.80
-  swa_update_interval: 100
-
-  # B3 — warmup procedurale nei primi step (~0.3% di 9000)
-  procedural_warmup_steps: 30
 
 # Mamba-2 specific
 mamba:
@@ -98,8 +88,6 @@ data:
   tokenizer_path: "tokenizer/tokenizer.json"
   streaming: true
   num_workers: 4
-  dedup: true               # B2: dedup online cross-source
-  dedup_capacity: 5000000
 
 # Evaluation
 evaluation:

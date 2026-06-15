@@ -53,105 +53,11 @@ per riuso in fase POST-training (continued pretraining IT + SFT IT).
 import torch
 from torch.utils.data import IterableDataset
 import random
-import re
-import math
-import hashlib
 from datasets import load_dataset
 import json
 import os
 import glob
 from typing import Optional, Dict, Iterator, List
-
-
-# ===========================================================================
-# B2 — Dedup online cross-source (Bloom filter, memoria fissa, niente dipendenze)
-# ===========================================================================
-
-class _BloomFilter:
-    """Bloom filter compatto per dedup streaming. ~6MB per 5M doc @ 1% FPR.
-
-    Falsi positivi possibili (occasionalmente scarta un doc nuovo): accettabile.
-    Falsi negativi impossibili (non lascia mai passare un duplicato esatto già visto).
-    """
-    def __init__(self, capacity: int = 5_000_000, error_rate: float = 0.01):
-        m = int(-capacity * math.log(error_rate) / (math.log(2) ** 2))
-        self.m = max(8, m)
-        self.k = max(1, int((self.m / max(1, capacity)) * math.log(2)))
-        self.bits = bytearray((self.m + 7) // 8)
-
-    def add_if_new(self, data: bytes) -> bool:
-        """True se NUOVO (e lo registra); False se probabilmente già visto."""
-        h = hashlib.blake2b(data, digest_size=16).digest()
-        h1 = int.from_bytes(h[:8], "little")
-        h2 = int.from_bytes(h[8:], "little") | 1   # dispari → buon passo per double hashing
-        is_new = False
-        for i in range(self.k):
-            idx = (h1 + i * h2) % self.m
-            byte, bit = idx >> 3, idx & 7
-            if not (self.bits[byte] >> bit) & 1:
-                is_new = True
-                self.bits[byte] |= (1 << bit)
-        return is_new
-
-
-def _fingerprint(text: str) -> bytes:
-    """Firma normalizzata (lowercase + whitespace collassati) → cattura dup esatti e
-    near-dup con sole differenze di formattazione (tipiche dell'overlap CommonCrawl)."""
-    return re.sub(r"\s+", " ", text.lower()).strip().encode("utf-8", "ignore")
-
-
-# ===========================================================================
-# B3 — Warmup procedurale (sequenze di Dyck / parentesi bilanciate)
-# ===========================================================================
-
-class ProceduralWarmupDataset(IterableDataset):
-    """B3: dati procedurali astratti (parentesi bilanciate multi-tipo) per i primi step.
-
-    Front-loading di struttura formale → migliora retrieval/long-context e riduce i FLOP
-    per raggiungere la stessa loss (arXiv 2601.21725). Generato on-the-fly, nessuna rete.
-    """
-    _PAIRS = [("(", ")"), ("[", "]"), ("{", "}"), ("<", ">")]
-
-    def __init__(self, tokenizer, max_length: int = 512, batch_size: int = 4,
-                 seed: int = 42, n_bracket_types: int = 4):
-        self.tokenizer = tokenizer
-        self.max_length = max_length
-        self.batch_size = batch_size
-        self.seed = seed
-        self.pairs = self._PAIRS[:max(1, min(4, n_bracket_types))]
-
-    def _gen_one(self, rng: random.Random) -> str:
-        target = rng.randint(20, 240)
-        out, stack = [], []
-        while len(out) < target:
-            if stack and rng.random() < 0.5:
-                out.append(stack.pop())
-            else:
-                o, c = self.pairs[rng.randrange(len(self.pairs))]
-                out.append(o)
-                stack.append(c)
-        while stack:
-            out.append(stack.pop())
-        return "".join(out)
-
-    def __iter__(self):
-        rng = random.Random(self.seed)
-        eos = getattr(self.tokenizer, "eos_token_id", None)
-        token_buffer, batch_in = [], []
-        while True:
-            text = " ".join(self._gen_one(rng) for _ in range(rng.randint(3, 8)))
-            toks = self.tokenizer.encode(text)
-            if eos is not None:
-                toks.append(eos)
-            token_buffer.extend(toks)
-            while len(token_buffer) >= self.max_length:
-                chunk = token_buffer[:self.max_length]
-                token_buffer = token_buffer[self.max_length:]
-                batch_in.append(torch.tensor(chunk, dtype=torch.long))
-                if len(batch_in) >= self.batch_size:
-                    t = torch.stack(batch_in)
-                    yield t, t.clone()   # train su tutti i token (struttura)
-                    batch_in = []
 
 
 class EllediDatasetV2(IterableDataset):
@@ -173,9 +79,7 @@ class EllediDatasetV2(IterableDataset):
         max_length: int = 512,
         batch_size: int = 4,
         seed: int = 42,
-        hf_token: Optional[str] = None,
-        dedup: bool = True,                 # B2: dedup online cross-source
-        dedup_capacity: int = 5_000_000,
+        hf_token: Optional[str] = None
     ):
         self.tokenizer = tokenizer
         self.phase = phase
@@ -183,11 +87,6 @@ class EllediDatasetV2(IterableDataset):
         self.batch_size = batch_size
         self.seed = seed
         self.hf_token = hf_token or os.environ.get("HF_TOKEN")
-
-        # B2: Bloom filter per scartare documenti duplicati tra sorgenti (overlap CommonCrawl)
-        self.dedup = dedup
-        self._bloom = _BloomFilter(capacity=dedup_capacity) if dedup else None
-        self._dedup_skipped = 0
 
         # Define mixing ratios based on phase
         self._setup_ratios()
@@ -205,40 +104,34 @@ class EllediDatasetV2(IterableDataset):
         self._init_streams()
 
     def _setup_ratios(self):
-        """Mix dati per fase — SOLO sorgenti NON-gated (i dataset NVIDIA Nemotron-* e
-        bigcode/the-stack-v2 negano l'accesso) + B1 (math/code anche in Fase 1).
-
-        I loader gated (nemotron_cc_v2/math/sft, stack_v2_smol) restano definiti nel file
-        per riuso futuro se l'accesso venisse concesso, ma NON sono nei mix attivi.
-        """
+        """Set up data mixing ratios based on training phase (top-tier EN mix)."""
         if self.phase == 1:
-            # Phase 1: foundation web + B1 (15% math/code per un foundation più forte)
+            # Phase 1: EN Foundation web — solo top-tier
             self.ratios = {
-                'fineweb_edu': 0.42,    # edu web HQ (no gate)
-                'dclm_baseline': 0.30,  # web diversity (no gate)
-                'cosmopedia': 0.13,     # synthetic textbook (no gate)
-                'openwebmath': 0.08,    # B1: math foundation (no gate)
-                'github_code': 0.07,    # B1: code foundation (no gate)
+                'fineweb_edu': 0.45,
+                'dclm_baseline': 0.25,
+                'nemotron_cc_v2': 0.20,
+                'cosmopedia': 0.10,
             }
             self.sources = list(self.ratios.keys())
         elif self.phase == 2:
-            # Phase 2: Math + code heavy — tutte no-gate
+            # Phase 2: Math + code — solo top-tier
             self.ratios = {
-                'github_code': 0.30,    # rimpiazza Stack v2 (gated)
-                'openwebmath': 0.25,    # rimpiazza Nemotron-CC-Math (gated)
-                'finemath_4plus': 0.20, # HF FineMath (no gate)
-                'proof_pile_2': 0.15,   # formal math + arxiv (no gate)
-                'mathcode_pile': 0.10,  # math+code reasoning (Apache, no gate)
+                'stack_v2_smol': 0.30,
+                'nemotron_cc_math': 0.25,
+                'finemath_4plus': 0.20,
+                'proof_pile_2': 0.15,
+                'mathcode_pile': 0.10,
             }
             self.sources = list(self.ratios.keys())
         elif self.phase == 3:
-            # Phase 3: Reasoning + instruction — tutte no-gate
+            # Phase 3: Reasoning + instruction — solo top-tier
             self.ratios = {
-                'openr1_math': 0.25,        # DeepSeek-R1 CoT verificati 220K (no gate)
-                'openmath_reasoning': 0.25, # NVIDIA AoPS 306K (CC-BY, no gate)
-                'natural_reasoning': 0.20,  # Meta 1.15M general reasoning (no gate)
-                'tulu3': 0.25,              # Allen AI top instruction (no gate)
-                'openhermes': 0.05,         # rimpiazza Nemotron-SFT (gated); OpenHermes 2.5 no gate
+                'openr1_math': 0.25,        # DeepSeek-R1 CoT verificati 220K
+                'openmath_reasoning': 0.25, # NVIDIA AoPS 306K, no gate
+                'natural_reasoning': 0.20,  # Meta 1.15M general reasoning
+                'tulu3': 0.20,              # Allen AI top instruction
+                'nemotron_sft_v1': 0.10,    # NVIDIA STEM/code/math SFT
             }
             self.sources = list(self.ratios.keys())
         else:
@@ -586,26 +479,6 @@ class EllediDatasetV2(IterableDataset):
             print(f"  Stack v2 smol failed: {e}, falling back to starcoderdata")
             return self._get_stack_stream()
 
-    def _get_github_code_stream(self) -> Iterator:
-        """Codice GitHub NON-gated (alternativa a Stack v2 che è gated).
-
-        Prova più sorgenti aperte in ordine; fallback finale a MathCode-Pile (Apache, no gate).
-        Il campo testo (code/content) è gestito dall'estrazione generica in _get_next_sample.
-        """
-        attempts = [
-            ("codeparrot/github-code-clean", {"name": "all-all", "trust_remote_code": True}),
-            ("codeparrot/codeparrot-clean", {}),
-        ]
-        for repo, kw in attempts:
-            try:
-                ds = load_dataset(repo, split="train", streaming=True, token=self.hf_token, **kw)
-                print(f"  GitHub code stream: {repo}")
-                return iter(ds.shuffle(seed=random.randint(0, 100000), buffer_size=1000))
-            except Exception as e:
-                print(f"  {repo} non disponibile: {e}")
-        print("  Codice non disponibile → fallback MathCode-Pile (Apache, no gate)")
-        return self._get_mathcode_pile_stream()
-
     def _get_starcoder_pr_stream(self) -> Iterator:
         """StarCoder PRs: GitHub PR + Jupyter + Kaggle for code diversity."""
         print("Loading StarCoder GitHub PRs stream...")
@@ -752,7 +625,6 @@ class EllediDatasetV2(IterableDataset):
         'nemotron_cc_v2': '_get_nemotron_cc_v2_stream',
         'cosmopedia': '_get_cosmopedia_stream',
         # Math + code
-        'github_code': '_get_github_code_stream',
         'stack_v2_smol': '_get_stack_v2_smol_stream',
         'finemath_4plus': '_get_finemath_4plus_stream',
         'nemotron_cc_math': '_get_nemotron_cc_math_stream',
@@ -822,16 +694,15 @@ class EllediDatasetV2(IterableDataset):
             # Extract text based on source format
             plain_text_sources = {
                 'fineweb_edu', 'dclm_baseline', 'nemotron_cc_v2', 'cosmopedia',
-                'github_code', 'stack_v2_smol', 'finemath_4plus', 'nemotron_cc_math',
+                'stack_v2_smol', 'finemath_4plus', 'nemotron_cc_math',
                 'openwebmath', 'proof_pile_2', 'mathcode_pile', 'starcoder_pr',
                 'stack', 'culturax_it', 'wikipedia_it', 'english_mix',
             }
             messages_sources = {'tulu3', 'openhermes', 'magpie', 'nemotron_sft_v1'}
 
             if source in plain_text_sources:
-                # HF datasets: "text" standard; alcuni usano "content"/"raw_content"/"code" (codice)
-                text = (item.get("text") or item.get("content")
-                        or item.get("raw_content") or item.get("code") or "")
+                # HF datasets standard "text" field; some use "content" or "raw_content"
+                text = item.get("text") or item.get("content") or item.get("raw_content") or ""
             elif source in messages_sources:
                 # ChatML-formatted multi-turn: {"messages": [{"role": ..., "content": ...}, ...]}
                 messages = item.get("messages") or item.get("conversations") or []
@@ -933,18 +804,13 @@ class EllediDatasetV2(IterableDataset):
                 return source
         return self.sources[-1]
 
-    # A3: marcatore di inizio risposta assistant in formato ChatML
-    _ASSISTANT_MARKER = "<|im_start|>assistant\n"
-
     def __iter__(self):
         """
-        Yield (input_ids, labels) batch tensors [batch, max_length].
-        PACKING: accumula testi completi con EOS fino a max_length.
-        A3: per i sample istruzione (ChatML) i token del prompt sono mascherati a -100
-            (loss solo sulla risposta dell'assistant).
+        Yield batches of tokenized sequences.
+        Uses PACKING: accumulates complete texts with EOS until max_length.
         """
-        batch_in, batch_lab = [], []
-        token_buffer, label_buffer = [], []
+        batch = []
+        token_buffer = []
 
         while True:
             # Select source based on ratios
@@ -955,11 +821,6 @@ class EllediDatasetV2(IterableDataset):
             if not text:
                 continue
 
-            # B2: scarta duplicati cross-source (Bloom filter su firma normalizzata)
-            if self._bloom is not None and not self._bloom.add_if_new(_fingerprint(text)):
-                self._dedup_skipped += 1
-                continue
-
             # Tokenize
             try:
                 tokens = self.tokenizer.encode(text)
@@ -968,40 +829,25 @@ class EllediDatasetV2(IterableDataset):
                 if len(tokens) < 10:
                     continue
 
-                labels = list(tokens)
-
-                # A3: maschera il prompt nei sample istruzione ChatML single-turn
-                # (train solo sulla risposta). Pretraining plain text → nessuna maschera.
-                if text.startswith("<|im_start|>user") and self._ASSISTANT_MARKER in text:
-                    prompt_prefix = text[: text.index(self._ASSISTANT_MARKER) + len(self._ASSISTANT_MARKER)]
-                    plen = len(self.tokenizer.encode(prompt_prefix))
-                    for i in range(min(plen, len(labels))):
-                        labels[i] = -100
-
-                # Add EOS token after each text (train per predire EOS)
+                # Add EOS token after each text
                 eos_id = self.tokenizer.eos_token_id
                 if eos_id is not None:
                     tokens.append(eos_id)
-                    labels.append(eos_id)
 
-                # PACKING: Add tokens + labels to buffers
+                # PACKING: Add tokens to buffer
                 token_buffer.extend(tokens)
-                label_buffer.extend(labels)
 
-                # When buffer is full, extract training samples (chunk esatti = no padding)
+                # When buffer is full, extract training samples
                 while len(token_buffer) >= self.max_length:
-                    in_chunk = token_buffer[:self.max_length]
-                    lab_chunk = label_buffer[:self.max_length]
+                    sample_tokens = token_buffer[:self.max_length]
                     token_buffer = token_buffer[self.max_length:]
-                    label_buffer = label_buffer[self.max_length:]
 
-                    batch_in.append(torch.tensor(in_chunk, dtype=torch.long))
-                    batch_lab.append(torch.tensor(lab_chunk, dtype=torch.long))
+                    batch.append(torch.tensor(sample_tokens, dtype=torch.long))
 
                     # Yield batch when full
-                    if len(batch_in) >= self.batch_size:
-                        yield torch.stack(batch_in), torch.stack(batch_lab)
-                        batch_in, batch_lab = [], []
+                    if len(batch) >= self.batch_size:
+                        yield self._collate(batch)
+                        batch = []
 
             except Exception:
                 continue

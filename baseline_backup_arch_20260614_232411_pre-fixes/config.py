@@ -210,27 +210,26 @@ class ElleciConfig:
         # Sync max_seq_len so MLA's RoPE cache matches the model context window
         self.mla.max_seq_len = self.max_seq_len
 
-        # R5: rispetta mla.n_heads se già valido (passato esplicitamente da YAML/config builder);
-        # auto-deriva SOLO se incompatibile con d_model. Prima questo blocco sovrascriveva
-        # SEMPRE n_heads (es. YAML 32 → 16 forzato, head_dim 128→256 silenzioso).
-        if self.d_model % self.mla.n_heads != 0:
-            if self.d_model >= 1024:
-                self.mla.n_heads = 16
-            elif self.d_model >= 768:
-                self.mla.n_heads = 12
-            else:
-                # For smaller models, find largest divisor <= 16
-                for n in [16, 12, 8, 4, 2, 1]:
-                    if self.d_model % n == 0:
-                        self.mla.n_heads = n
-                        break
+        # Auto-set n_heads based on d_model (head_dim should be 64-128)
+        # d_model=768 -> 12 heads (head_dim=64)
+        # d_model=1024 -> 16 heads (head_dim=64)
+        # d_model=2048 -> 16 heads (head_dim=128)
+        if self.d_model >= 2048:
+            self.mla.n_heads = 16  # head_dim = 128
+        elif self.d_model >= 1024:
+            self.mla.n_heads = 16  # head_dim = 64
+        elif self.d_model >= 768:
+            self.mla.n_heads = 12  # head_dim = 64 for 768d
+        else:
+            # For smaller models, find largest divisor <= 16
+            for n in [16, 12, 8, 4, 2, 1]:
+                if self.d_model % n == 0:
+                    self.mla.n_heads = n
+                    break
 
         # Verify divisibility
         assert self.d_model % self.mla.n_heads == 0, \
             f"d_model ({self.d_model}) must be divisible by n_heads ({self.mla.n_heads})"
-
-        # Sync head_dim: MLAConfig.__post_init__ può averlo calcolato con un n_heads diverso.
-        self.mla.head_dim = self.d_model // self.mla.n_heads
         
     def to_dict(self):
         """Convert config to dictionary"""

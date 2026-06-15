@@ -22,10 +22,8 @@ model:
 
   # INT2 specific
   use_int2: true
-  # C4 — HESTIA annealing ATTIVO: soglia alta all'inizio (update INT2 rari = stabilità early),
-  # poi scende al valore finale durante il warmup (più plasticità). Valori tunabili.
-  int2_threshold: 4          # HESTIA target steady-state (dopo warmup)
-  int2_threshold_init: 7     # HESTIA: alta soglia iniziale (max rappresentabile INT4 signed)
+  int2_threshold: 7
+  int2_threshold_init: 7     # HESTIA: massimo rappresentabile in INT4 signed
   use_24_sparsity: false     # Sparse-BitNet: sparsità 2:4 per Sparse Tensor Cores (opzionale)
   use_hadamard_int4: false   # BitNet v2: Hadamard+INT4 attivazioni (vs INT8)
   int2_lr_scale: 5.0
@@ -63,18 +61,6 @@ training:
   # CPU offload for INT2 activations
   enable_offload: false    # A100 has enough VRAM
 
-  # SWA / model averaging (C2) — preferito al decay LR aggressivo col curriculum
-  use_swa: true
-  swa_start_ratio: 0.80      # inizia a mediare dall'80% del training
-  swa_update_interval: 100   # aggiorna la media ogni 100 step
-
-  # Curriculum a fasi (R2) — boundary opzionali; default 60/25/15 di max_steps
-  # phase1_end_step: 30000
-  # phase2_end_step: 42500
-
-  # B3 — warmup procedurale (Dyck/parentesi) nei primi step (~0.3% del training)
-  procedural_warmup_steps: 150
-
 # Optimizations
 optimizations:
   # Disabled for INT2
@@ -103,26 +89,26 @@ checkpointing:
   output_dir: "checkpoints/7b_training"
   save_total_limit: 3
   resume_from: null
-  # C3 — flusso 16→1.58: checkpoint FP16 (da train_fp16.py) per init continual QAT.
-  # Override anche da CLI: python train.py --config ... --init-from-fp16 <path>
-  init_from_fp16: null
 
-# Data — EN-only, mix SOLO NON-gated (i dataset NVIDIA Nemotron-* e Stack-v2 negano l'accesso)
-# Mix dettagliato in data/elleci_dataset_v2.py (_setup_ratios per phase). B1: math/code anche in Fase 1.
-# Phase 1 (60%): foundation+B1 — FineWeb-Edu 42 / DCLM 30 / Cosmopedia 13 / OpenWebMath 8 / GitHub-code 7
-# Phase 2 (25%): math+code     — GitHub-code 30 / OpenWebMath 25 / FineMath 20 / Proof-Pile-2 15 / MathCode-Pile 10
-# Phase 3 (15%): reasoning+SFT — OpenR1-Math 25 / OpenMathReasoning 25 / NaturalReasoning 20 / Tulu 3 25 / OpenHermes 5
+# Data — EN-only top-tier mix (max intelligence density)
+# Mix dettagliato in data/elleci_dataset_v2.py (_setup_ratios per phase).
+# Phase 1 (60%): foundation web — FineWeb-Edu 45 / DCLM 25 / Nemotron-CC v2 20 / Cosmopedia 10
+# Phase 2 (25%): math+code     — Stack v2 30 / Nemotron-Math 25 / FineMath 20 / Proof-Pile-2 15 / MathCode-Pile 10
+# Phase 3 (15%): reasoning+SFT — OpenR1-Math 25 / OpenMathReasoning 25 / NaturalReasoning 20 / Tulu 3 20 / Nemotron-SFT 10
 data:
   dataset: "fineweb-edu"             # Legacy field, dataset reale gestito da EllediDatasetV2
   tokenizer_path: "tokenizer/tokenizer.json"
   streaming: true
   num_workers: 8
-  dedup: true                        # B2: dedup online cross-source (Bloom filter)
-  dedup_capacity: 5000000            # ~6MB; alza per run lunghi (più doc unici tracciati)
 
-  # Tutti i dataset del mix attivo sono NON-gated (no accept TOS). Serve solo:
-  #   HF_TOKEN=hf_xxx in .env (read access) per i rate limit. I loader gated
-  #   (nemotron_cc_v2/math/sft, stack_v2_smol) restano nel codice ma NON sono nei mix.
+  # GATED datasets (richiedono accept TOS su HF web prima di poter scaricare):
+  #   - nvidia/Nemotron-CC-v2
+  #   - nvidia/Nemotron-CC-Math-v1
+  #   - nvidia/Nemotron-Pretraining-SFT-v1
+  #   - bigcode/the-stack-v2-train-smol-ids
+  # Setup .env:
+  #   HF_TOKEN=hf_xxx   # generato da https://huggingface.co/settings/tokens (read access)
+  # Poi visita ogni link gated e clicca "Agree and access repository".
 
 # Evaluation
 evaluation:

@@ -154,11 +154,28 @@ class Mamba2Block(nn.Module):
         
         # Delta (dt) projection - per head
         self.dt_proj = nn.Linear(self.n_heads, self.d_inner, bias=True)
-        # R1: marca dt_proj così Elleci._init_weights NON sovrascrive il suo init speciale
-        # (altrimenti bias→0 e weight→N(0,0.02) → dt iniziale ~0.69 invece di ~0.018).
-        self.dt_proj._skip_default_init = True
-        self.reset_dt_parameters()
-
+        
+        # Initialize dt bias for stability (Preserve long-term memory)
+        # We want small initial dt values so decay is close to 1.
+        # dt_init range [0.001, 0.1] corresponds to decay [0.999, 0.9]
+        dt_init_min = 0.001
+        dt_init_max = 0.1
+        dt_init = torch.exp(
+            torch.rand(self.n_heads) * (math.log(dt_init_max) - math.log(dt_init_min))
+            + math.log(dt_init_min)
+        )
+        # inv_softplus(x) = log(exp(x) - 1)
+        # For small x, this is approx log(x)
+        inv_dt = torch.log(torch.exp(dt_init) - 1)
+        
+        # Broadcast to d_inner (since dt_proj maps n_heads -> d_inner)
+        # Each head controls head_dim channels
+        inv_dt = inv_dt.repeat_interleave(self.head_dim)
+        
+        with torch.no_grad():
+            self.dt_proj.weight.fill_(0.0) # Zero weight init for dt
+            self.dt_proj.bias.copy_(inv_dt)
+        
         # MAMBA-2 KEY CHANGE: Scalar A per head (not diagonal matrix)
         # This dramatically simplifies computation and enables Tensor Core usage
         # A is initialized to small negative values for stability
@@ -175,26 +192,7 @@ class Mamba2Block(nn.Module):
         
         # Activation
         self.act = nn.SiLU()
-
-    def reset_dt_parameters(self):
-        """Init speciale di dt_proj: weight=0, bias=inv_softplus(dt) con dt∈[0.001,0.1].
-
-        Mantiene dt iniziale piccolo (decay≈1) per preservare la memoria a lungo termine
-        all'inizio del training. Idempotente: ri-chiamabile dopo un init globale senza
-        effetti collaterali (vedi R1 / Elleci._init_weights).
-        """
-        dt_init_min = 0.001
-        dt_init_max = 0.1
-        dt_init = torch.exp(
-            torch.rand(self.n_heads) * (math.log(dt_init_max) - math.log(dt_init_min))
-            + math.log(dt_init_min)
-        )
-        # inv_softplus(x) = log(exp(x) - 1); broadcast n_heads → d_inner (head_dim canali/head)
-        inv_dt = torch.log(torch.exp(dt_init) - 1).repeat_interleave(self.head_dim)
-        with torch.no_grad():
-            self.dt_proj.weight.fill_(0.0)   # Zero weight init for dt
-            self.dt_proj.bias.copy_(inv_dt)
-
+        
     def forward(self, x, use_cache=False, past_state=None):
         """
         Forward pass through Mamba-2 block.
